@@ -369,13 +369,23 @@ with rapid_tab:
             st.subheader("Rapid results")
             st.metric("Risk level", result.get("level", "unknown"))
             st.write("Score:", result.get("score", 0))
+            confidence_score = result.get("confidence_score")
+            if isinstance(confidence_score, (int, float)):
+                if confidence_score >= 0.7:
+                    confidence_label = "High"
+                elif confidence_score >= 0.4:
+                    confidence_label = "Medium"
+                else:
+                    confidence_label = "Low"
+                st.write(f"Confidence: {confidence_label}")
             if result.get("is_valid") is False:
                 flags = result.get("quality_flags", [])
                 flag_text = ", ".join(flags) if flags else "quality flags"
                 st.info(f"This evaluation wasn't counted because: {flag_text}")
             signals = result.get("signals", [])
             if signals:
-                st.write("Top signals:", ", ".join(signals))
+                top_signals = signals[:3]
+                st.write("Why this result?", ", ".join(top_signals))
             actions = result.get("recommended_actions", [])
             if actions:
                 st.write("Next 15 minutes:")

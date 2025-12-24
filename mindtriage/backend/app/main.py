@@ -3,6 +3,7 @@ from __future__ import annotations
 import random
 from datetime import date, datetime, timedelta
 import json
+import statistics
 from typing import List, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
@@ -11,7 +12,7 @@ from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel
-from sqlalchemy import Boolean, Column, Date, DateTime, ForeignKey, Integer, String, create_engine, func, text, or_
+from sqlalchemy import Boolean, Column, Date, DateTime, Float, ForeignKey, Integer, String, create_engine, func, text, or_
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import Session, relationship, sessionmaker
 
@@ -65,6 +66,7 @@ class RapidEvaluation(Base):
     score = Column(Integer, nullable=False)
     level = Column(String, nullable=False)
     signals_json = Column(String, nullable=False)
+    confidence_score = Column(Float, nullable=True)
     is_valid = Column(Boolean, default=True, nullable=False)
     quality_flags_json = Column(String, nullable=False, default="[]")
 
@@ -171,6 +173,7 @@ class RapidSubmitResponse(BaseModel):
     signals: List[str]
     recommended_actions: List[str]
     crisis_guidance: Optional[List[str]] = None
+    confidence_score: float
     is_valid: bool
     quality_flags: List[str]
     entry_date: str
@@ -351,6 +354,8 @@ def ensure_rapid_columns() -> None:
                 connection.execute(text("ALTER TABLE rapid_evaluations ADD COLUMN is_valid BOOLEAN DEFAULT 1"))
             if "quality_flags_json" not in columns:
                 connection.execute(text("ALTER TABLE rapid_evaluations ADD COLUMN quality_flags_json TEXT DEFAULT '[]'"))
+            if "confidence_score" not in columns:
+                connection.execute(text("ALTER TABLE rapid_evaluations ADD COLUMN confidence_score FLOAT"))
             connection.commit()
 
 
@@ -860,6 +865,16 @@ def rapid_submit(
         quality_flags.append("duplicate_answers")
 
     is_valid = len(quality_flags) == 0
+    attention_passed = "failed_attention_check" not in quality_flags
+    last_valid_answers = json.loads(last_valid.answers_json) if last_valid else None
+    confidence_score = compute_confidence_score(
+        answers_by_slug=answers_by_slug,
+        started_at=started_at,
+        submitted_at=submitted_at,
+        attention_passed=attention_passed,
+        last_valid_answers=last_valid_answers,
+    )
+    signals = signals[:3]
 
     if active_session:
         active_session.entry_date = entry_date
@@ -869,6 +884,7 @@ def rapid_submit(
         active_session.score = score
         active_session.level = level
         active_session.signals_json = json.dumps(signals)
+        active_session.confidence_score = confidence_score
         active_session.is_valid = is_valid
         active_session.quality_flags_json = json.dumps(quality_flags)
     else:
@@ -881,6 +897,7 @@ def rapid_submit(
             score=score,
             level=level,
             signals_json=json.dumps(signals),
+            confidence_score=confidence_score,
             is_valid=is_valid,
             quality_flags_json=json.dumps(quality_flags),
         )
@@ -893,6 +910,7 @@ def rapid_submit(
         signals=signals,
         recommended_actions=actions,
         crisis_guidance=crisis,
+        confidence_score=confidence_score,
         is_valid=is_valid,
         quality_flags=quality_flags,
         entry_date=entry_date.isoformat(),
@@ -1046,3 +1064,61 @@ def crisis_resources() -> List[str]:
         "Reach out to a trusted person or local crisis line.",
         "If you are in the U.S., you can call or text 988 for immediate support.",
     ]
+
+
+def compute_confidence_score(
+    answers_by_slug: dict[str, str],
+    started_at: Optional[datetime],
+    submitted_at: datetime,
+    attention_passed: bool,
+    last_valid_answers: Optional[dict[str, str]],
+) -> float:
+    if started_at:
+        time_taken = max(0.0, (submitted_at - started_at).total_seconds())
+        time_score = min(time_taken / 120.0, 1.0)
+    else:
+        time_score = 0.3
+
+    attention_score = 1.0 if attention_passed else 0.0
+
+    numeric_values: List[float] = []
+    for slug, value in answers_by_slug.items():
+        if slug in {"rapid_mood", "rapid_anxiety"}:
+            numeric = parse_numeric(value)
+            if numeric is not None:
+                numeric_values.append(float(numeric))
+        elif slug in {"rapid_hopeless", "rapid_isolation", "rapid_support", "rapid_self_harm_thoughts", "rapid_self_harm_plan", "rapid_substance"}:
+            yes_value = is_yes(value)
+            if yes_value is not None:
+                numeric_values.append(1.0 if yes_value else 0.0)
+        elif slug in {"rapid_sleep", "rapid_appetite"}:
+            mapping = {"good": 2.0, "okay": 1.0, "poor": 0.0}
+            mapped = mapping.get(value.strip().lower())
+            if mapped is not None:
+                numeric_values.append(mapped)
+
+    if len(numeric_values) >= 2:
+        variance = statistics.pvariance(numeric_values)
+        variance_score = min(variance / 9.0, 1.0)
+    else:
+        variance_score = 0.2
+
+    if last_valid_answers:
+        matches = 0
+        total = 0
+        for key, value in answers_by_slug.items():
+            total += 1
+            if last_valid_answers.get(key) == value:
+                matches += 1
+        similarity = (matches / total) if total else 0.0
+        similarity_score = max(0.0, 1.0 - similarity)
+    else:
+        similarity_score = 0.7
+
+    confidence = (
+        0.35 * time_score
+        + 0.25 * attention_score
+        + 0.2 * variance_score
+        + 0.2 * similarity_score
+    )
+    return max(0.0, min(1.0, confidence))
