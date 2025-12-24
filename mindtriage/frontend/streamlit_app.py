@@ -71,7 +71,8 @@ def api_post(path: str, json=None, data=None):
 st.title("MindTriage")
 st.caption("Not a diagnosis. If you feel unsafe contact local emergency services.")
 
-login_tab, care_tab = st.tabs(["Account", "Check-in & Journal"])
+rapid_tab_label = "Rapid Evaluation"
+login_tab, care_tab, rapid_tab = st.tabs(["Account", "Check-in & Journal", rapid_tab_label])
 
 st.subheader("Backend connection check")
 health_resp = api_get("/health")
@@ -283,3 +284,81 @@ with care_tab:
             show_response_error(history_resp, "/risk/history", "Unable to load risk history.")
 
 st.caption("Not a diagnosis. If you feel unsafe contact local emergency services.")
+
+with rapid_tab:
+    st.subheader("Rapid Evaluation")
+    st.caption("Not a diagnosis. If you feel unsafe contact local emergency services.")
+    if not st.session_state.token:
+        st.warning("Sign in on the Account tab to continue.")
+    else:
+        rapid_date = st.date_input("Evaluation date", value=date.today(), key="rapid_date")
+        questions_resp = api_get("/rapid/questions")
+        if questions_resp is None:
+            st.stop()
+        if not questions_resp.ok:
+            show_response_error(questions_resp, "/rapid/questions", "Unable to load rapid questions.")
+            st.stop()
+
+        questions = safe_json(questions_resp) or []
+        if not questions:
+            st.info("No rapid questions available.")
+            st.stop()
+
+        with st.form("rapid_form"):
+            rapid_answers = []
+            for question in questions:
+                qid = question["id"]
+                qslug = question["slug"]
+                qtext = question["text"]
+                qformat = question.get("format")
+                if qformat == "scale":
+                    value = st.slider(qtext, 1, 10, 5, key=f"rapid_{qid}")
+                    answer_text = str(value)
+                elif qformat == "choice":
+                    choices = question.get("choices") or ["Good", "Okay", "Poor"]
+                    answer_text = st.selectbox(qtext, choices, key=f"rapid_{qid}")
+                elif qformat == "yesno":
+                    answer_text = st.selectbox(qtext, ["No", "Yes"], key=f"rapid_{qid}")
+                else:
+                    answer_text = st.text_input(qtext, key=f"rapid_{qid}")
+                rapid_answers.append({"question_id": qid, "answer_text": answer_text})
+            if st.form_submit_button("Submit rapid evaluation"):
+                payload = {"entry_date": rapid_date.isoformat(), "answers": rapid_answers}
+                resp = api_post("/rapid/submit", json=payload)
+                if resp is not None and resp.ok:
+                    st.session_state.rapid_result = safe_json(resp) or {}
+                    st.success("Rapid evaluation saved.")
+                elif resp is not None:
+                    show_response_error(resp, "/rapid/submit", "Rapid evaluation failed.")
+
+        result = st.session_state.get("rapid_result")
+        if result:
+            st.subheader("Rapid results")
+            st.metric("Risk level", result.get("level", "unknown"))
+            st.write("Score:", result.get("score", 0))
+            signals = result.get("signals", [])
+            if signals:
+                st.write("Top signals:", ", ".join(signals))
+            actions = result.get("recommended_actions", [])
+            if actions:
+                st.write("Next 15 minutes:")
+                for action in actions:
+                    st.write(f"- {action}")
+            crisis = result.get("crisis_guidance") or []
+            if crisis:
+                st.error("Crisis guidance")
+                for item in crisis:
+                    st.write(f"- {item}")
+
+        st.subheader("Recent rapid evaluations")
+        history_resp = api_get("/rapid/history")
+        if history_resp is not None and history_resp.ok:
+            history = safe_json(history_resp) or []
+            if history:
+                recent = history[-5:]
+                for entry in reversed(recent):
+                    st.write(f"{entry['date']} | score {entry['score']} | level {entry['level']}")
+            else:
+                st.info("No rapid evaluations yet.")
+        elif history_resp is not None:
+            show_response_error(history_resp, "/rapid/history", "Unable to load rapid history.")

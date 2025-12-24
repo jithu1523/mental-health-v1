@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import random
 from datetime import date, datetime, timedelta
+import json
 from typing import List, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
@@ -49,6 +50,19 @@ class JournalEntry(Base):
     entry_date = Column(Date, default=date.today, nullable=True)
 
     user = relationship("User", back_populates="journal_entries")
+
+
+class RapidEvaluation(Base):
+    __tablename__ = "rapid_evaluations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    entry_date = Column(Date, default=date.today, nullable=True)
+    answers_json = Column(String, nullable=False)
+    score = Column(Integer, nullable=False)
+    level = Column(String, nullable=False)
+    signals_json = Column(String, nullable=False)
 
 
 class Question(Base):
@@ -126,6 +140,34 @@ class RiskHistoryEntry(BaseModel):
     level: str
 
 
+class RapidQuestion(BaseModel):
+    id: int
+    slug: str
+    text: str
+    kind: str
+    format: str
+    choices: Optional[List[str]] = None
+
+
+class RapidAnswer(BaseModel):
+    question_id: int
+    answer_text: str
+
+
+class RapidSubmitRequest(BaseModel):
+    entry_date: Optional[date] = None
+    answers: List[RapidAnswer]
+
+
+class RapidSubmitResponse(BaseModel):
+    level: str
+    score: int
+    signals: List[str]
+    recommended_actions: List[str]
+    crisis_guidance: Optional[List[str]] = None
+    entry_date: str
+
+
 app = FastAPI(title="MindTriage API")
 
 app.add_middleware(
@@ -159,6 +201,81 @@ DAILY_QUESTIONS = [
     {"kind": "daily", "slug": "daily_focus", "text": "How is your focus today?"},
     {"kind": "daily", "slug": "daily_isolation", "text": "Do you feel isolated today?"},
     {"kind": "daily", "slug": "daily_hopeless", "text": "Have you felt hopeless today?"},
+]
+
+RAPID_QUESTIONS = [
+    {
+        "id": 1,
+        "slug": "rapid_mood",
+        "text": "Rate your mood right now (1-10).",
+        "kind": "rapid",
+        "format": "scale",
+    },
+    {
+        "id": 2,
+        "slug": "rapid_anxiety",
+        "text": "Rate your anxiety right now (1-10).",
+        "kind": "rapid",
+        "format": "scale",
+    },
+    {
+        "id": 3,
+        "slug": "rapid_hopeless",
+        "text": "Are you feeling hopeless right now?",
+        "kind": "rapid",
+        "format": "yesno",
+    },
+    {
+        "id": 4,
+        "slug": "rapid_isolation",
+        "text": "Do you feel isolated right now?",
+        "kind": "rapid",
+        "format": "yesno",
+    },
+    {
+        "id": 5,
+        "slug": "rapid_sleep",
+        "text": "How was your sleep last night?",
+        "kind": "rapid",
+        "format": "choice",
+        "choices": ["Good", "Okay", "Poor"],
+    },
+    {
+        "id": 6,
+        "slug": "rapid_appetite",
+        "text": "How is your appetite today?",
+        "kind": "rapid",
+        "format": "choice",
+        "choices": ["Good", "Okay", "Poor"],
+    },
+    {
+        "id": 7,
+        "slug": "rapid_support",
+        "text": "Do you have someone you can reach out to right now?",
+        "kind": "rapid",
+        "format": "yesno",
+    },
+    {
+        "id": 8,
+        "slug": "rapid_self_harm_thoughts",
+        "text": "Are you having thoughts of self-harm?",
+        "kind": "rapid",
+        "format": "yesno",
+    },
+    {
+        "id": 9,
+        "slug": "rapid_self_harm_plan",
+        "text": "Do you have intent or a plan to act on those thoughts?",
+        "kind": "rapid",
+        "format": "yesno",
+    },
+    {
+        "id": 10,
+        "slug": "rapid_substance",
+        "text": "Have you used alcohol or substances to cope today?",
+        "kind": "rapid",
+        "format": "yesno",
+    },
 ]
 
 
@@ -575,3 +692,192 @@ def contains_risk_keywords(text: str) -> bool:
         "self harm",
         "can't go on",
     ])
+
+
+@app.get("/rapid/questions", response_model=List[RapidQuestion])
+def rapid_questions() -> List[RapidQuestion]:
+    return [RapidQuestion(**question) for question in RAPID_QUESTIONS]
+
+
+@app.post("/rapid/submit", response_model=RapidSubmitResponse)
+def rapid_submit(
+    payload: RapidSubmitRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> RapidSubmitResponse:
+    if not payload.answers:
+        raise HTTPException(status_code=400, detail="No answers provided")
+
+    question_lookup = {q["id"]: q for q in RAPID_QUESTIONS}
+    answers_by_slug: dict[str, str] = {}
+    for answer in payload.answers:
+        question = question_lookup.get(answer.question_id)
+        if not question:
+            raise HTTPException(status_code=400, detail=f"Unknown question ID: {answer.question_id}")
+        answers_by_slug[question["slug"]] = answer.answer_text.strip()
+
+    level, score, signals, actions, crisis = compute_rapid_risk(answers_by_slug)
+    entry_date = payload.entry_date or date.today()
+
+    evaluation = RapidEvaluation(
+        user_id=user.id,
+        entry_date=entry_date,
+        answers_json=json.dumps(answers_by_slug),
+        score=score,
+        level=level,
+        signals_json=json.dumps(signals),
+    )
+    db.add(evaluation)
+    db.commit()
+
+    return RapidSubmitResponse(
+        level=level,
+        score=score,
+        signals=signals,
+        recommended_actions=actions,
+        crisis_guidance=crisis,
+        entry_date=entry_date.isoformat(),
+    )
+
+
+@app.get("/rapid/history", response_model=List[RiskHistoryEntry])
+def rapid_history(
+    days: int = Query(30, ge=1, le=365),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> List[RiskHistoryEntry]:
+    start_date = date.today() - timedelta(days=days - 1)
+    evaluations = (
+        db.query(RapidEvaluation)
+        .filter(
+            RapidEvaluation.user_id == user.id,
+            RapidEvaluation.entry_date.isnot(None),
+            RapidEvaluation.entry_date >= start_date,
+        )
+        .order_by(RapidEvaluation.entry_date.asc(), RapidEvaluation.created_at.desc())
+        .all()
+    )
+
+    by_date: dict[date, RapidEvaluation] = {}
+    for evaluation in evaluations:
+        day = evaluation.entry_date
+        existing = by_date.get(day)
+        if not existing or evaluation.score > existing.score:
+            by_date[day] = evaluation
+
+    history = [
+        RiskHistoryEntry(
+            date=day.isoformat(),
+            score=entry.score,
+            level=entry.level,
+        )
+        for day, entry in sorted(by_date.items())
+    ]
+    return history
+
+
+def compute_rapid_risk(
+    answers_by_slug: dict[str, str]
+) -> tuple[str, int, List[str], List[str], Optional[List[str]]]:
+    score = 0
+    signals: List[str] = []
+
+    mood_value = parse_numeric(answers_by_slug.get("rapid_mood", ""))
+    if mood_value is not None and mood_value <= 3:
+        score += 3
+        signals.append("Low mood rating")
+
+    anxiety_value = parse_numeric(answers_by_slug.get("rapid_anxiety", ""))
+    if anxiety_value is not None and anxiety_value >= 8:
+        score += 3
+        signals.append("High anxiety rating")
+
+    if is_yes(answers_by_slug.get("rapid_hopeless", "")):
+        score += 4
+        signals.append("Reported hopelessness")
+
+    if is_yes(answers_by_slug.get("rapid_isolation", "")):
+        score += 2
+        signals.append("Reported isolation")
+
+    if is_choice(answers_by_slug.get("rapid_sleep", ""), "Poor"):
+        score += 1
+        signals.append("Poor sleep")
+
+    if is_choice(answers_by_slug.get("rapid_appetite", ""), "Poor"):
+        score += 1
+        signals.append("Low appetite")
+
+    if is_yes(answers_by_slug.get("rapid_support", "")) is False:
+        score += 1
+        signals.append("Limited support right now")
+
+    if is_yes(answers_by_slug.get("rapid_substance", "")):
+        score += 1
+        signals.append("Substance use today")
+
+    self_harm_thoughts = is_yes(answers_by_slug.get("rapid_self_harm_thoughts", ""))
+    self_harm_plan = is_yes(answers_by_slug.get("rapid_self_harm_plan", ""))
+    if self_harm_thoughts:
+        score += 6
+        signals.append("Self-harm thoughts")
+
+    crisis_guidance = None
+    if self_harm_plan:
+        level = "RED"
+        score = max(score, 18)
+        signals.append("Self-harm plan or intent")
+        crisis_guidance = crisis_resources()
+    elif score >= 12:
+        level = "RED"
+        crisis_guidance = crisis_resources()
+    elif score >= 6:
+        level = "YELLOW"
+    else:
+        level = "GREEN"
+
+    actions = recommended_actions(level)
+    return level, score, list(dict.fromkeys(signals)), actions, crisis_guidance
+
+
+def is_yes(value: str) -> Optional[bool]:
+    if not value:
+        return None
+    lowered = value.strip().lower()
+    if lowered in {"yes", "y", "true", "1"}:
+        return True
+    if lowered in {"no", "n", "false", "0"}:
+        return False
+    return None
+
+
+def is_choice(value: str, target: str) -> bool:
+    return value.strip().lower() == target.strip().lower()
+
+
+def recommended_actions(level: str) -> List[str]:
+    if level == "RED":
+        return [
+            "Pause and focus on slow breathing for 2 minutes.",
+            "Move to a safer, quieter space if possible.",
+            "Reach out to someone you trust and let them know you need support.",
+        ]
+    if level == "YELLOW":
+        return [
+            "Do a 2-minute grounding exercise (name 5 things you can see).",
+            "Drink water and take a short break from screens.",
+            "Write down one small next step you can do today.",
+        ]
+    return [
+        "Take a slow breath and notice how your body feels.",
+        "Pick one small, kind action for yourself in the next hour.",
+        "Stay connected to a supportive person if you can.",
+    ]
+
+
+def crisis_resources() -> List[str]:
+    return [
+        "If you feel unsafe, contact local emergency services.",
+        "Reach out to a trusted person or local crisis line.",
+        "If you are in the U.S., you can call or text 988 for immediate support.",
+    ]
