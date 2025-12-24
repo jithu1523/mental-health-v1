@@ -44,6 +44,28 @@ uvicorn mindtriage.backend.app.main:app --reload
 
 FastAPI docs: http://127.0.0.1:8000/docs
 
+### Dev mode (rapid evaluation limits)
+
+Enable lower rapid-evaluation cooldowns/limits for local testing:
+
+Windows PowerShell:
+
+```powershell
+$env:MINDTRIAGE_DEV_MODE="1"
+```
+
+Windows CMD:
+
+```cmd
+set MINDTRIAGE_DEV_MODE=1
+```
+
+macOS / Linux:
+
+```bash
+export MINDTRIAGE_DEV_MODE=1
+```
+
 ## Run the frontend
 
 In a second terminal (with the venv active):

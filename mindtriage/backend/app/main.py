@@ -3,6 +3,7 @@ from __future__ import annotations
 import random
 from datetime import date, datetime, timedelta
 import json
+import os
 from typing import List, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
@@ -420,7 +421,12 @@ def get_current_user(
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok"}
+    return {"status": "ok", "dev_mode": is_dev_mode()}
+
+
+def is_dev_mode() -> bool:
+    value = os.getenv("MINDTRIAGE_DEV_MODE", "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
 
 
 @app.post("/auth/register", response_model=TokenResponse)
@@ -797,6 +803,13 @@ def rapid_submit(
     db: Session = Depends(get_db),
 ) -> RapidSubmitResponse:
     now = datetime.utcnow()
+    if is_dev_mode():
+        cooldown_seconds = 5
+        daily_limit = 50
+    else:
+        cooldown_seconds = 5 * 60
+        daily_limit = 3
+
     last_eval = (
         db.query(RapidEvaluation)
         .filter(RapidEvaluation.user_id == user.id, RapidEvaluation.submitted_at.isnot(None))
@@ -804,10 +817,12 @@ def rapid_submit(
         .first()
     )
     if last_eval:
-        if last_eval.submitted_at and (now - last_eval.submitted_at) < timedelta(minutes=5):
+        if last_eval.submitted_at and (now - last_eval.submitted_at) < timedelta(seconds=cooldown_seconds):
+            wait_seconds = int(cooldown_seconds - (now - last_eval.submitted_at).total_seconds())
             raise HTTPException(
                 status_code=429,
-                detail="Please wait at least 5 minutes between rapid evaluations.",
+                detail="Please wait before starting another rapid evaluation.",
+                headers={"Retry-After": str(max(wait_seconds, 1))},
             )
 
     cutoff = now - timedelta(hours=24)
@@ -820,10 +835,10 @@ def rapid_submit(
         )
         .count()
     )
-    if recent_count >= 3:
+    if recent_count >= daily_limit:
         raise HTTPException(
             status_code=429,
-            detail="Daily limit reached (3 rapid evaluations in 24 hours). Please try again later.",
+            detail=f"Daily limit reached ({daily_limit} rapid evaluations in 24 hours). Please try again later.",
         )
 
     if not payload.answers:

@@ -11,6 +11,8 @@ API_BASE = st.text_input("API base URL", value="http://127.0.0.1:8000")
 
 if "token" not in st.session_state:
     st.session_state.token = None
+if "dev_mode" not in st.session_state:
+    st.session_state.dev_mode = False
 if "daily_questions" not in st.session_state:
     st.session_state.daily_questions = None
 if "rapid_session_id" not in st.session_state:
@@ -84,7 +86,12 @@ health_resp = api_get("/health")
 if health_resp is None:
     st.error("Backend check failed. Start backend with: uvicorn app.main:app --reload --port 8000")
 elif health_resp.ok:
-    st.success(f"Backend healthy ({health_resp.status_code}) | {api_url('/health')}")
+    payload = safe_json(health_resp) or {}
+    st.session_state.dev_mode = bool(payload.get("dev_mode"))
+    message = f"Backend healthy ({health_resp.status_code}) | {api_url('/health')}"
+    if st.session_state.dev_mode:
+        message += " | Dev mode enabled"
+    st.success(message)
 else:
     snippet = (health_resp.text or "").strip()
     st.error(
@@ -360,7 +367,11 @@ with rapid_tab:
                 elif resp is not None:
                     if resp.status_code == 429:
                         detail = (safe_json(resp) or {}).get("detail", resp.text)
-                        st.warning(detail)
+                        retry_after = resp.headers.get("Retry-After")
+                        if retry_after:
+                            st.warning(f"{detail} Retry after {retry_after} seconds.")
+                        else:
+                            st.warning(detail)
                     else:
                         show_response_error(resp, "/rapid/submit", "Rapid evaluation failed.")
 
