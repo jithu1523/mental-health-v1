@@ -1,6 +1,7 @@
 from datetime import date, datetime
 
 import altair as alt
+import pandas as pd
 import requests
 import streamlit as st
 
@@ -260,7 +261,7 @@ with care_tab:
         if history_resp is not None and history_resp.ok:
             history = safe_json(history_resp) or []
             if len(history) == 0:
-                st.info("Add more daily check-ins to see trends.")
+                st.info("Add a few daily check-ins to see trends.")
             elif len(history) == 1:
                 st.info("Need at least 2 days to show a trend.")
             else:
@@ -271,12 +272,16 @@ with care_tab:
                     {"ymin": 9, "ymax": 17, "color": "#fff2cc"},
                     {"ymin": 18, "ymax": chart_max, "color": "#ffe1e1"},
                 ]
-                band_chart = alt.Chart(band_data).mark_rect(opacity=0.4).encode(
+                bands_df = pd.DataFrame(band_data)
+                trend_df = pd.DataFrame(history)
+                trend_df["date"] = pd.to_datetime(trend_df["date"])
+
+                band_chart = alt.Chart(bands_df).mark_rect(opacity=0.4).encode(
                     y=alt.Y("ymin:Q", title="Risk score", scale=alt.Scale(domain=[0, chart_max])),
                     y2="ymax:Q",
                     color=alt.Color("color:N", scale=None, legend=None),
                 )
-                line_chart = alt.Chart(history).mark_line(point=True).encode(
+                line_chart = alt.Chart(trend_df).mark_line(point=True).encode(
                     x=alt.X("date:T", title="Date"),
                     y=alt.Y("score:Q", scale=alt.Scale(domain=[0, chart_max])),
                     tooltip=["date:T", "score:Q", "level:N"],
