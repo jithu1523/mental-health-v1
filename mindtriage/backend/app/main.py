@@ -3,7 +3,6 @@ from __future__ import annotations
 import random
 from datetime import date, datetime, timedelta
 import json
-import statistics
 from typing import List, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
@@ -67,6 +66,8 @@ class RapidEvaluation(Base):
     level = Column(String, nullable=False)
     signals_json = Column(String, nullable=False)
     confidence_score = Column(Float, nullable=True)
+    explainability_json = Column(String, nullable=False, default="[]")
+    time_taken_seconds = Column(Float, nullable=True)
     is_valid = Column(Boolean, default=True, nullable=False)
     quality_flags_json = Column(String, nullable=False, default="[]")
 
@@ -167,6 +168,12 @@ class RapidSubmitRequest(BaseModel):
     answers: List[RapidAnswer]
 
 
+class RapidExplainabilityItem(BaseModel):
+    signal: str
+    weight: float
+    reason: str
+
+
 class RapidSubmitResponse(BaseModel):
     level: str
     score: int
@@ -174,8 +181,10 @@ class RapidSubmitResponse(BaseModel):
     recommended_actions: List[str]
     crisis_guidance: Optional[List[str]] = None
     confidence_score: float
+    explanations: List[RapidExplainabilityItem]
     is_valid: bool
     quality_flags: List[str]
+    time_taken_seconds: float
     entry_date: str
 
 
@@ -356,6 +365,10 @@ def ensure_rapid_columns() -> None:
                 connection.execute(text("ALTER TABLE rapid_evaluations ADD COLUMN quality_flags_json TEXT DEFAULT '[]'"))
             if "confidence_score" not in columns:
                 connection.execute(text("ALTER TABLE rapid_evaluations ADD COLUMN confidence_score FLOAT"))
+            if "explainability_json" not in columns:
+                connection.execute(text("ALTER TABLE rapid_evaluations ADD COLUMN explainability_json TEXT DEFAULT '[]'"))
+            if "time_taken_seconds" not in columns:
+                connection.execute(text("ALTER TABLE rapid_evaluations ADD COLUMN time_taken_seconds FLOAT"))
             connection.commit()
 
 
@@ -838,17 +851,18 @@ def rapid_submit(
             raise HTTPException(status_code=400, detail=f"Unknown question ID: {answer.question_id}")
         answers_by_slug[question["slug"]] = answer.answer_text.strip()
 
-    level, score, signals, actions, crisis = compute_rapid_risk(answers_by_slug)
+    level, score, signals, explanations, actions, crisis = compute_rapid_risk(answers_by_slug)
     entry_date = payload.entry_date or (active_session.entry_date if active_session else date.today())
     started_at = active_session.started_at if active_session else (payload.started_at or now)
     submitted_at = now
+    time_taken_seconds = (submitted_at - started_at).total_seconds() if started_at else 0.0
 
-    quality_flags: List[str] = []
-    if started_at and (submitted_at - started_at).total_seconds() < 25:
-        quality_flags.append("too_fast")
+    invalid_flags: List[str] = []
+    if started_at and time_taken_seconds < 25:
+        invalid_flags.append("too_fast")
     attention = answers_by_slug.get("rapid_attention_check", "")
     if attention.strip().lower() != "sometimes":
-        quality_flags.append("failed_attention_check")
+        invalid_flags.append("failed_attention_check")
 
     answers_payload = json.dumps(answers_by_slug, sort_keys=True)
     last_valid = (
@@ -862,19 +876,21 @@ def rapid_submit(
         .first()
     )
     if last_valid and last_valid.answers_json == answers_payload:
-        quality_flags.append("duplicate_answers")
+        invalid_flags.append("duplicate_answers")
 
-    is_valid = len(quality_flags) == 0
-    attention_passed = "failed_attention_check" not in quality_flags
-    last_valid_answers = json.loads(last_valid.answers_json) if last_valid else None
-    confidence_score = compute_confidence_score(
-        answers_by_slug=answers_by_slug,
-        started_at=started_at,
-        submitted_at=submitted_at,
-        attention_passed=attention_passed,
-        last_valid_answers=last_valid_answers,
-    )
-    signals = signals[:3]
+    soft_flags: List[str] = []
+    if detect_patterned_answers(answers_by_slug):
+        soft_flags.append("patterned_answers")
+    if detect_extreme_only_answers(answers_by_slug):
+        soft_flags.append("extreme_only_answers")
+
+    quality_flags = list(dict.fromkeys(invalid_flags + soft_flags))
+    is_valid = len(invalid_flags) == 0
+    confidence_score = compute_rapid_confidence_score(time_taken_seconds, quality_flags)
+
+    explanations_sorted = sorted(explanations, key=lambda item: item.weight, reverse=True)
+    top_explanations = explanations_sorted[:3]
+    signals = [item.reason for item in top_explanations]
 
     if active_session:
         active_session.entry_date = entry_date
@@ -885,6 +901,8 @@ def rapid_submit(
         active_session.level = level
         active_session.signals_json = json.dumps(signals)
         active_session.confidence_score = confidence_score
+        active_session.explainability_json = json.dumps([item.model_dump() for item in top_explanations])
+        active_session.time_taken_seconds = time_taken_seconds
         active_session.is_valid = is_valid
         active_session.quality_flags_json = json.dumps(quality_flags)
     else:
@@ -898,6 +916,8 @@ def rapid_submit(
             level=level,
             signals_json=json.dumps(signals),
             confidence_score=confidence_score,
+            explainability_json=json.dumps([item.model_dump() for item in top_explanations]),
+            time_taken_seconds=time_taken_seconds,
             is_valid=is_valid,
             quality_flags_json=json.dumps(quality_flags),
         )
@@ -911,8 +931,10 @@ def rapid_submit(
         recommended_actions=actions,
         crisis_guidance=crisis,
         confidence_score=confidence_score,
+        explanations=top_explanations,
         is_valid=is_valid,
         quality_flags=quality_flags,
+        time_taken_seconds=time_taken_seconds,
         entry_date=entry_date.isoformat(),
     )
 
@@ -961,55 +983,65 @@ def rapid_history(
 
 def compute_rapid_risk(
     answers_by_slug: dict[str, str]
-) -> tuple[str, int, List[str], List[str], Optional[List[str]]]:
+) -> tuple[str, int, List[str], List[RapidExplainabilityItem], List[str], Optional[List[str]]]:
     score = 0
     signals: List[str] = []
+    explanations: List[RapidExplainabilityItem] = []
+
+    def add_signal(signal: str, weight: float, reason: str) -> None:
+        explanations.append(RapidExplainabilityItem(signal=signal, weight=weight, reason=reason))
+        signals.append(reason)
 
     mood_value = parse_numeric(answers_by_slug.get("rapid_mood", ""))
     if mood_value is not None and mood_value <= 3:
         score += 3
-        signals.append("Low mood rating")
+        add_signal("low_mood", 3, "Low mood rating")
 
     anxiety_value = parse_numeric(answers_by_slug.get("rapid_anxiety", ""))
     if anxiety_value is not None and anxiety_value >= 8:
         score += 3
-        signals.append("High anxiety rating")
+        add_signal("high_anxiety", 3, "High anxiety rating")
 
     if is_yes(answers_by_slug.get("rapid_hopeless", "")):
         score += 4
-        signals.append("Reported hopelessness")
+        add_signal("hopelessness", 4, "Reported hopelessness")
 
     if is_yes(answers_by_slug.get("rapid_isolation", "")):
         score += 2
-        signals.append("Reported isolation")
+        add_signal("isolation", 2, "Reported isolation")
 
     if is_choice(answers_by_slug.get("rapid_sleep", ""), "Poor"):
         score += 1
-        signals.append("Poor sleep")
+        add_signal("poor_sleep", 1, "Poor sleep")
 
     if is_choice(answers_by_slug.get("rapid_appetite", ""), "Poor"):
         score += 1
-        signals.append("Low appetite")
+        add_signal("low_appetite", 1, "Low appetite")
 
     if is_yes(answers_by_slug.get("rapid_support", "")) is False:
         score += 1
-        signals.append("Limited support right now")
+        add_signal("limited_support", 1, "Limited support right now")
 
     if is_yes(answers_by_slug.get("rapid_substance", "")):
         score += 1
-        signals.append("Substance use today")
+        add_signal("substance_use", 1, "Substance use today")
 
     self_harm_thoughts = is_yes(answers_by_slug.get("rapid_self_harm_thoughts", ""))
     self_harm_plan = is_yes(answers_by_slug.get("rapid_self_harm_plan", ""))
     if self_harm_thoughts:
         score += 6
-        signals.append("Self-harm thoughts")
+        add_signal("self_harm_thoughts", 6, "Self-harm thoughts")
 
     crisis_guidance = None
     if self_harm_plan:
+        before = score
         level = "RED"
         score = max(score, 18)
-        signals.append("Self-harm plan or intent")
+        add_signal(
+            "self_harm_plan",
+            max(0, score - before),
+            "Self-harm plan or intent",
+        )
         crisis_guidance = crisis_resources()
     elif score >= 12:
         level = "RED"
@@ -1020,7 +1052,7 @@ def compute_rapid_risk(
         level = "GREEN"
 
     actions = recommended_actions(level)
-    return level, score, list(dict.fromkeys(signals)), actions, crisis_guidance
+    return level, score, list(dict.fromkeys(signals)), explanations, actions, crisis_guidance
 
 
 def is_yes(value: str) -> Optional[bool]:
@@ -1066,59 +1098,50 @@ def crisis_resources() -> List[str]:
     ]
 
 
-def compute_confidence_score(
-    answers_by_slug: dict[str, str],
-    started_at: Optional[datetime],
-    submitted_at: datetime,
-    attention_passed: bool,
-    last_valid_answers: Optional[dict[str, str]],
-) -> float:
-    if started_at:
-        time_taken = max(0.0, (submitted_at - started_at).total_seconds())
-        time_score = min(time_taken / 120.0, 1.0)
-    else:
-        time_score = 0.3
+def compute_rapid_confidence_score(time_taken_seconds: float, quality_flags: List[str]) -> float:
+    confidence = 0.6
+    if time_taken_seconds >= 60:
+        confidence += 0.15
+    elif 35 <= time_taken_seconds <= 59:
+        confidence += 0.10
 
-    attention_score = 1.0 if attention_passed else 0.0
+    if "too_fast" in quality_flags:
+        confidence -= 0.20
+    if "failed_attention_check" in quality_flags:
+        confidence -= 0.25
+    if "duplicate_answers" in quality_flags:
+        confidence -= 0.10
+    if "patterned_answers" in quality_flags:
+        confidence -= 0.10
+    if "extreme_only_answers" in quality_flags:
+        confidence -= 0.10
 
-    numeric_values: List[float] = []
-    for slug, value in answers_by_slug.items():
-        if slug in {"rapid_mood", "rapid_anxiety"}:
-            numeric = parse_numeric(value)
-            if numeric is not None:
-                numeric_values.append(float(numeric))
-        elif slug in {"rapid_hopeless", "rapid_isolation", "rapid_support", "rapid_self_harm_thoughts", "rapid_self_harm_plan", "rapid_substance"}:
-            yes_value = is_yes(value)
-            if yes_value is not None:
-                numeric_values.append(1.0 if yes_value else 0.0)
-        elif slug in {"rapid_sleep", "rapid_appetite"}:
-            mapping = {"good": 2.0, "okay": 1.0, "poor": 0.0}
-            mapped = mapping.get(value.strip().lower())
-            if mapped is not None:
-                numeric_values.append(mapped)
+    return max(0.05, min(0.95, confidence))
 
-    if len(numeric_values) >= 2:
-        variance = statistics.pvariance(numeric_values)
-        variance_score = min(variance / 9.0, 1.0)
-    else:
-        variance_score = 0.2
 
-    if last_valid_answers:
-        matches = 0
-        total = 0
-        for key, value in answers_by_slug.items():
-            total += 1
-            if last_valid_answers.get(key) == value:
-                matches += 1
-        similarity = (matches / total) if total else 0.0
-        similarity_score = max(0.0, 1.0 - similarity)
-    else:
-        similarity_score = 0.7
+def detect_patterned_answers(answers_by_slug: dict[str, str]) -> bool:
+    values = [
+        value.strip().lower()
+        for slug, value in answers_by_slug.items()
+        if slug != "rapid_attention_check" and value.strip()
+    ]
+    if len(values) < 5:
+        return False
+    counts: dict[str, int] = {}
+    for value in values:
+        counts[value] = counts.get(value, 0) + 1
+    most_common = max(counts.values()) if counts else 0
+    if most_common == len(values):
+        return True
+    return (most_common / len(values)) >= 0.8
 
-    confidence = (
-        0.35 * time_score
-        + 0.25 * attention_score
-        + 0.2 * variance_score
-        + 0.2 * similarity_score
-    )
-    return max(0.0, min(1.0, confidence))
+
+def detect_extreme_only_answers(answers_by_slug: dict[str, str]) -> bool:
+    numeric_values: List[int] = []
+    for slug in ["rapid_mood", "rapid_anxiety"]:
+        numeric = parse_numeric(answers_by_slug.get(slug, ""))
+        if numeric is not None:
+            numeric_values.append(numeric)
+    if len(numeric_values) < 2:
+        return False
+    return all(value <= 2 or value >= 9 for value in numeric_values)

@@ -371,21 +371,26 @@ with rapid_tab:
             st.write("Score:", result.get("score", 0))
             confidence_score = result.get("confidence_score")
             if isinstance(confidence_score, (int, float)):
-                if confidence_score >= 0.7:
+                if confidence_score >= 0.8:
                     confidence_label = "High"
-                elif confidence_score >= 0.4:
+                elif confidence_score >= 0.55:
                     confidence_label = "Medium"
                 else:
                     confidence_label = "Low"
                 st.write(f"Confidence: {confidence_label}")
+                if confidence_label == "Low":
+                    st.info("Confidence is low because your answers were too quick/inconsistent. You can retake slowly.")
             if result.get("is_valid") is False:
                 flags = result.get("quality_flags", [])
                 flag_text = ", ".join(flags) if flags else "quality flags"
                 st.info(f"This evaluation wasn't counted because: {flag_text}")
-            signals = result.get("signals", [])
-            if signals:
-                top_signals = signals[:3]
-                st.write("Why this result?", ", ".join(top_signals))
+            explanations = result.get("explanations", [])
+            if explanations:
+                st.write("Why this result?")
+                for item in explanations[:3]:
+                    reason = item.get("reason", "Signal")
+                    weight = item.get("weight", 0)
+                    st.write(f"- {reason} (impact {weight})")
             actions = result.get("recommended_actions", [])
             if actions:
                 st.write("Next 15 minutes:")
