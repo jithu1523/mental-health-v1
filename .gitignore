@@ -1,4 +1,9 @@
 .venv/
+mindtriage/backend/.venv/
+mindtriage/frontend/.venv/
 __pycache__/
+**/__pycache__/
+*.pyc
 *.db
+mindtriage.db
 .streamlit/
