@@ -25,6 +25,8 @@ source .venv/bin/activate
 Install backend requirements:
 
 ```bash
+pip uninstall -y bcrypt
+pip install bcrypt==4.0.1
 pip install -r mindtriage/backend/requirements.txt
 ```
 
