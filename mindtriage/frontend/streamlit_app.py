@@ -17,9 +17,35 @@ def api_headers() -> dict:
     return {}
 
 
+def api_url(path: str) -> str:
+    return f"{API_BASE}{path}"
+
+
+def safe_json(resp: requests.Response):
+    content_type = resp.headers.get("content-type", "")
+    if "application/json" not in content_type:
+        return None
+    try:
+        return resp.json()
+    except ValueError:
+        return None
+
+
+def show_response_error(resp: requests.Response, path: str, fallback_message: str) -> None:
+    url = api_url(path)
+    payload = safe_json(resp)
+    if payload and isinstance(payload, dict):
+        detail = payload.get("detail", fallback_message)
+        st.error(f"{fallback_message} ({resp.status_code}) | {url} | {detail}")
+        return
+    text = (resp.text or "").strip()
+    snippet = text[:500] if text else "No response body."
+    st.error(f"{fallback_message} ({resp.status_code}) | {url} | {snippet}")
+
+
 def api_get(path: str):
     try:
-        return requests.get(f"{API_BASE}{path}", headers=api_headers(), timeout=10)
+        return requests.get(api_url(path), headers=api_headers(), timeout=10)
     except requests.RequestException as exc:
         st.error(f"Request failed: {exc}")
         return None
@@ -28,7 +54,7 @@ def api_get(path: str):
 def api_post(path: str, json=None, data=None):
     try:
         return requests.post(
-            f"{API_BASE}{path}",
+            api_url(path),
             headers=api_headers(),
             json=json,
             data=data,
@@ -44,6 +70,20 @@ st.caption("Not a diagnosis. If you feel unsafe contact local emergency services
 
 login_tab, care_tab = st.tabs(["Account", "Check-in & Journal"])
 
+st.subheader("Backend connection check")
+health_resp = api_get("/health")
+if health_resp is None:
+    st.error("Backend check failed. Start backend with: uvicorn app.main:app --reload --port 8000")
+elif health_resp.ok:
+    st.success(f"Backend healthy ({health_resp.status_code}) | {api_url('/health')}")
+else:
+    snippet = (health_resp.text or "").strip()
+    st.error(
+        f"Backend unhealthy ({health_resp.status_code}) | {api_url('/health')} | "
+        f"{snippet[:500] if snippet else 'No response body.'}"
+    )
+    st.error("Start backend with: uvicorn app.main:app --reload --port 8000")
+
 with login_tab:
     st.subheader("Sign up")
     with st.form("register_form"):
@@ -55,11 +95,12 @@ with login_tab:
             else:
                 resp = api_post("/auth/register", json={"email": reg_email, "password": reg_password})
                 if resp is not None and resp.ok:
-                    token = resp.json().get("access_token")
+                    payload = safe_json(resp) or {}
+                    token = payload.get("access_token")
                     st.session_state.token = token
                     st.success("Account created. You are signed in.")
                 elif resp is not None:
-                    st.error(resp.json().get("detail", "Registration failed."))
+                    show_response_error(resp, "/auth/register", "Registration failed.")
 
     st.subheader("Login")
     with st.form("login_form"):
@@ -74,11 +115,12 @@ with login_tab:
                     data={"username": login_email, "password": login_password},
                 )
                 if resp is not None and resp.ok:
-                    token = resp.json().get("access_token")
+                    payload = safe_json(resp) or {}
+                    token = payload.get("access_token")
                     st.session_state.token = token
                     st.success("Signed in.")
                 elif resp is not None:
-                    st.error(resp.json().get("detail", "Login failed."))
+                    show_response_error(resp, "/auth/login", "Login failed.")
 
     if st.session_state.token:
         st.info("Authenticated.")
