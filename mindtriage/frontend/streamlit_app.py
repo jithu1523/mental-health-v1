@@ -249,6 +249,36 @@ with care_tab:
             else:
                 st.info("No journal entries yet.")
 
+        if st.session_state.dev_mode:
+            st.subheader("Developer Tools")
+            if st.button("Seed demo data (14 days)"):
+                resp = api_post("/dev/seed_demo")
+                if resp is not None and resp.ok:
+                    payload = safe_json(resp) or {}
+                    created = payload.get("created", {})
+                    st.success(
+                        "Demo data created: "
+                        f"{created.get('answers', 0)} answers, "
+                        f"{created.get('journals', 0)} journals, "
+                        f"{created.get('rapid_evaluations', 0)} rapid evaluations."
+                    )
+                    st.markdown("[Go to Risk Trend](#risk-trend)")
+                elif resp is not None:
+                    show_response_error(resp, "/dev/seed_demo", "Unable to seed demo data.")
+            if st.button("Clear demo data"):
+                resp = api_post("/dev/clear_demo")
+                if resp is not None and resp.ok:
+                    payload = safe_json(resp) or {}
+                    deleted = payload.get("deleted", {})
+                    st.success(
+                        "Demo data cleared: "
+                        f"{deleted.get('answers', 0)} answers, "
+                        f"{deleted.get('journals', 0)} journals, "
+                        f"{deleted.get('rapid_evaluations', 0)} rapid evaluations."
+                    )
+                elif resp is not None:
+                    show_response_error(resp, "/dev/clear_demo", "Unable to clear demo data.")
+
         st.subheader("Triage")
         risk_resp = api_get("/risk/latest")
         if risk_resp is not None and risk_resp.ok:
@@ -265,6 +295,7 @@ with care_tab:
         elif risk_resp is not None:
             st.error(risk_resp.json().get("detail", "Unable to load risk status."))
 
+        st.markdown("<a name='risk-trend'></a>", unsafe_allow_html=True)
         st.subheader("Risk Trend")
         history_resp = api_get("/risk/history")
         if history_resp is not None and history_resp.ok:

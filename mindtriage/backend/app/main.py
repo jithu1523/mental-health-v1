@@ -49,6 +49,7 @@ class JournalEntry(Base):
     content = Column(String, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     entry_date = Column(Date, default=date.today, nullable=True)
+    is_demo = Column(Boolean, default=False, nullable=False)
 
     user = relationship("User", back_populates="journal_entries")
 
@@ -71,6 +72,7 @@ class RapidEvaluation(Base):
     time_taken_seconds = Column(Float, nullable=True)
     is_valid = Column(Boolean, default=True, nullable=False)
     quality_flags_json = Column(String, nullable=False, default="[]")
+    is_demo = Column(Boolean, default=False, nullable=False)
 
 
 class Question(Base):
@@ -92,6 +94,7 @@ class Answer(Base):
     answer_text = Column(String, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     entry_date = Column(Date, default=date.today, nullable=True)
+    is_demo = Column(Boolean, default=False, nullable=False)
 
     user = relationship("User", back_populates="answers")
     question = relationship("Question")
@@ -346,9 +349,13 @@ def ensure_entry_date_columns() -> None:
         answer_columns = {row[1] for row in connection.execute(text("PRAGMA table_info(answers)"))}
         if "entry_date" not in answer_columns:
             connection.execute(text("ALTER TABLE answers ADD COLUMN entry_date DATE"))
+        if "is_demo" not in answer_columns:
+            connection.execute(text("ALTER TABLE answers ADD COLUMN is_demo BOOLEAN DEFAULT 0"))
         journal_columns = {row[1] for row in connection.execute(text("PRAGMA table_info(journal_entries)"))}
         if "entry_date" not in journal_columns:
             connection.execute(text("ALTER TABLE journal_entries ADD COLUMN entry_date DATE"))
+        if "is_demo" not in journal_columns:
+            connection.execute(text("ALTER TABLE journal_entries ADD COLUMN is_demo BOOLEAN DEFAULT 0"))
         connection.commit()
 
 
@@ -370,6 +377,8 @@ def ensure_rapid_columns() -> None:
                 connection.execute(text("ALTER TABLE rapid_evaluations ADD COLUMN explainability_json TEXT DEFAULT '[]'"))
             if "time_taken_seconds" not in columns:
                 connection.execute(text("ALTER TABLE rapid_evaluations ADD COLUMN time_taken_seconds FLOAT"))
+            if "is_demo" not in columns:
+                connection.execute(text("ALTER TABLE rapid_evaluations ADD COLUMN is_demo BOOLEAN DEFAULT 0"))
             connection.commit()
 
 
@@ -994,6 +1003,178 @@ def rapid_history(
         for day, entry in sorted(by_date.items())
     ]
     return history
+
+
+def clear_demo_rows(user_id: int, db: Session) -> dict:
+    answers_deleted = (
+        db.query(Answer)
+        .filter(Answer.user_id == user_id, Answer.is_demo.is_(True))
+        .delete(synchronize_session=False)
+    )
+    journals_deleted = (
+        db.query(JournalEntry)
+        .filter(JournalEntry.user_id == user_id, JournalEntry.is_demo.is_(True))
+        .delete(synchronize_session=False)
+    )
+    rapid_deleted = (
+        db.query(RapidEvaluation)
+        .filter(RapidEvaluation.user_id == user_id, RapidEvaluation.is_demo.is_(True))
+        .delete(synchronize_session=False)
+    )
+    return {
+        "answers": answers_deleted,
+        "journals": journals_deleted,
+        "rapid_evaluations": rapid_deleted,
+    }
+
+
+@app.post("/dev/seed_demo")
+def seed_demo_data(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    if not is_dev_mode():
+        raise HTTPException(status_code=404, detail="Not found")
+
+    deleted = clear_demo_rows(user.id, db)
+    created_answers = 0
+    created_journals = 0
+    created_rapid = 0
+
+    daily_questions = (
+        db.query(Question)
+        .filter(Question.kind == "daily")
+        .all()
+    )
+    questions_by_slug = {q.slug: q for q in daily_questions}
+    target_slugs = ["daily_mood", "daily_anxiety", "daily_hopeless", "daily_isolation"]
+    required = [questions_by_slug.get(slug) for slug in target_slugs]
+    if any(item is None for item in required):
+        raise HTTPException(status_code=500, detail="Daily questions missing for demo data.")
+
+    today = date.today()
+    answer_rows: List[Answer] = []
+    for i in range(14):
+        day = today - timedelta(days=i)
+        created_at = datetime.combine(day, datetime.min.time()) + timedelta(hours=9)
+        mood_value = 7 if i % 3 else 3
+        anxiety_value = 4 if i % 4 else 8
+        hopeless_value = "Yes" if i % 5 == 0 else "No"
+        isolation_value = "Yes" if i % 4 == 0 else "No"
+        demo_answers = {
+            "daily_mood": str(mood_value),
+            "daily_anxiety": str(anxiety_value),
+            "daily_hopeless": hopeless_value,
+            "daily_isolation": isolation_value,
+        }
+        for slug, value in demo_answers.items():
+            question = questions_by_slug[slug]
+            answer_rows.append(Answer(
+                user_id=user.id,
+                question_id=question.id,
+                answer_text=value,
+                created_at=created_at,
+                entry_date=day,
+                is_demo=True,
+            ))
+        created_answers += len(demo_answers)
+
+    db.add_all(answer_rows)
+
+    journal_days = [0, 3, 6, 9, 12]
+    journal_texts = [
+        "Felt steady today and took a short walk.",
+        "A bit drained, but I reached out to a friend.",
+        "Feeling isolated and low energy.",
+        "Hard day. Thoughts of self-harm came up, but I stayed safe.",
+        "Sleep was better and I felt calmer.",
+    ]
+    for offset, text in zip(journal_days, journal_texts):
+        day = today - timedelta(days=offset)
+        created_at = datetime.combine(day, datetime.min.time()) + timedelta(hours=20)
+        db.add(JournalEntry(
+            user_id=user.id,
+            content=text,
+            created_at=created_at,
+            entry_date=day,
+            is_demo=True,
+        ))
+        created_journals += 1
+
+    rapid_dates = [1, 4, 8, 12]
+    for idx, offset in enumerate(rapid_dates):
+        day = today - timedelta(days=offset)
+        started_at = datetime.combine(day, datetime.min.time()) + timedelta(hours=10)
+        submitted_at = started_at + timedelta(seconds=70 if idx % 2 == 0 else 15)
+        answers_by_slug = {
+            "rapid_mood": "3" if idx % 2 == 0 else "7",
+            "rapid_anxiety": "8" if idx % 3 == 0 else "4",
+            "rapid_hopeless": "Yes" if idx == 1 else "No",
+            "rapid_isolation": "Yes" if idx % 2 == 0 else "No",
+            "rapid_sleep": "Poor" if idx % 2 == 0 else "Okay",
+            "rapid_appetite": "Okay",
+            "rapid_support": "No" if idx == 2 else "Yes",
+            "rapid_self_harm_thoughts": "No",
+            "rapid_self_harm_plan": "No",
+            "rapid_substance": "No",
+            "rapid_attention_check": "Sometimes" if idx != 3 else "Never",
+        }
+        level, score, _, explanations, _, _ = compute_rapid_risk(answers_by_slug)
+        time_taken_seconds = (submitted_at - started_at).total_seconds()
+        quality_flags: List[str] = []
+        invalid_flags: List[str] = []
+        if time_taken_seconds < 25:
+            invalid_flags.append("too_fast")
+        if answers_by_slug["rapid_attention_check"].lower() != "sometimes":
+            invalid_flags.append("failed_attention_check")
+        if idx == 2:
+            quality_flags.append("patterned_answers")
+        quality_flags = list(dict.fromkeys(invalid_flags + quality_flags))
+        is_valid = len(invalid_flags) == 0
+        confidence_score = compute_rapid_confidence_score(time_taken_seconds, quality_flags)
+        top_explanations = sorted(explanations, key=lambda item: item.weight, reverse=True)[:3]
+        signals = [item.reason for item in top_explanations]
+
+        db.add(RapidEvaluation(
+            user_id=user.id,
+            created_at=submitted_at,
+            entry_date=day,
+            started_at=started_at,
+            submitted_at=submitted_at,
+            answers_json=json.dumps(answers_by_slug, sort_keys=True),
+            score=score,
+            level=level,
+            signals_json=json.dumps(signals),
+            confidence_score=confidence_score,
+            explainability_json=json.dumps([item.model_dump() for item in top_explanations]),
+            time_taken_seconds=time_taken_seconds,
+            is_valid=is_valid,
+            quality_flags_json=json.dumps(quality_flags),
+            is_demo=True,
+        ))
+        created_rapid += 1
+
+    db.commit()
+    return {
+        "created": {
+            "answers": created_answers,
+            "journals": created_journals,
+            "rapid_evaluations": created_rapid,
+        },
+        "deleted": deleted,
+    }
+
+
+@app.post("/dev/clear_demo")
+def clear_demo_data(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    if not is_dev_mode():
+        raise HTTPException(status_code=404, detail="Not found")
+    deleted = clear_demo_rows(user.id, db)
+    db.commit()
+    return {"deleted": deleted}
 
 
 def compute_rapid_risk(
