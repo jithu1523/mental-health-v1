@@ -1,3 +1,5 @@
+from datetime import date
+
 import altair as alt
 import requests
 import streamlit as st
@@ -171,6 +173,7 @@ with care_tab:
             st.stop()
 
         st.subheader("Daily check-in")
+        selected_checkin_date = st.date_input("Check-in date", value=date.today())
         if st.button("Load daily questions") or st.session_state.daily_questions is None:
             pick_resp = api_get("/daily/pick")
             if pick_resp is not None and pick_resp.ok:
@@ -192,7 +195,11 @@ with care_tab:
                         answer_text = choice
                     else:
                         answer_text = st.text_input(question["text"], key=f"daily_{question['id']}")
-                    daily_answers.append({"question_id": question["id"], "answer_text": answer_text})
+                    daily_answers.append({
+                        "question_id": question["id"],
+                        "answer_text": answer_text,
+                        "entry_date": selected_checkin_date.isoformat(),
+                    })
                 if st.form_submit_button("Save daily answers"):
                     payload = {"answers": daily_answers}
                     resp = api_post("/answers", json=payload)
@@ -203,12 +210,16 @@ with care_tab:
                         st.error(resp.json().get("detail", "Unable to save daily answers."))
 
         st.subheader("Journal")
+        selected_journal_date = st.date_input("Journal date", value=date.today(), key="journal_date")
         journal_text = st.text_area("Write a short entry", height=140)
         if st.button("Save journal entry"):
             if not journal_text.strip():
                 st.warning("Write something before saving.")
             else:
-                resp = api_post("/journal", json={"content": journal_text})
+                resp = api_post(
+                    "/journal",
+                    json={"content": journal_text, "entry_date": selected_journal_date.isoformat()},
+                )
                 if resp is not None and resp.ok:
                     st.success("Journal entry saved.")
                 elif resp is not None:
@@ -245,8 +256,10 @@ with care_tab:
         history_resp = api_get("/risk/history")
         if history_resp is not None and history_resp.ok:
             history = safe_json(history_resp) or []
-            if len(history) < 3:
+            if len(history) == 0:
                 st.info("Add more daily check-ins to see trends.")
+            elif len(history) == 1:
+                st.info("Need at least 2 days to show a trend.")
             else:
                 max_score = max(item.get("score", 0) for item in history)
                 chart_max = max(20, max_score + 2)

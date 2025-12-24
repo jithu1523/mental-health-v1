@@ -10,7 +10,7 @@ from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, create_engine, func
+from sqlalchemy import Column, Date, DateTime, ForeignKey, Integer, String, create_engine, func, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import Session, relationship, sessionmaker
 
@@ -46,6 +46,7 @@ class JournalEntry(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     content = Column(String, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    entry_date = Column(Date, default=date.today, nullable=True)
 
     user = relationship("User", back_populates="journal_entries")
 
@@ -68,6 +69,7 @@ class Answer(Base):
     question_id = Column(Integer, ForeignKey("questions.id"), nullable=False)
     answer_text = Column(String, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    entry_date = Column(Date, default=date.today, nullable=True)
 
     user = relationship("User", back_populates="answers")
     question = relationship("Question")
@@ -93,6 +95,7 @@ class QuestionResponse(BaseModel):
 class AnswerCreate(BaseModel):
     question_id: int
     answer_text: str
+    entry_date: Optional[date] = None
 
 
 class AnswerBatch(BaseModel):
@@ -101,6 +104,7 @@ class AnswerBatch(BaseModel):
 
 class JournalCreate(BaseModel):
     content: str
+    entry_date: Optional[date] = None
 
 
 class JournalResponse(BaseModel):
@@ -161,6 +165,7 @@ DAILY_QUESTIONS = [
 @app.on_event("startup")
 def on_startup() -> None:
     Base.metadata.create_all(bind=engine)
+    ensure_entry_date_columns()
     seed_questions()
 
 
@@ -177,6 +182,17 @@ def seed_questions() -> None:
             session.commit()
     finally:
         session.close()
+
+
+def ensure_entry_date_columns() -> None:
+    with engine.connect() as connection:
+        answer_columns = {row[1] for row in connection.execute(text("PRAGMA table_info(answers)"))}
+        if "entry_date" not in answer_columns:
+            connection.execute(text("ALTER TABLE answers ADD COLUMN entry_date DATE"))
+        journal_columns = {row[1] for row in connection.execute(text("PRAGMA table_info(journal_entries)"))}
+        if "entry_date" not in journal_columns:
+            connection.execute(text("ALTER TABLE journal_entries ADD COLUMN entry_date DATE"))
+        connection.commit()
 
 
 def get_db() -> Session:
@@ -372,10 +388,12 @@ def submit_answers(
 
     created = []
     for item in payload.answers:
+        entry_date = item.entry_date or date.today()
         created.append(Answer(
             user_id=user.id,
             question_id=item.question_id,
             answer_text=item.answer_text.strip(),
+            entry_date=entry_date,
         ))
     db.add_all(created)
     db.commit()
@@ -391,7 +409,8 @@ def create_journal_entry(
     content = payload.content.strip()
     if not content:
         raise HTTPException(status_code=400, detail="Journal content cannot be empty")
-    entry = JournalEntry(user_id=user.id, content=content)
+    entry_date = payload.entry_date or date.today()
+    entry = JournalEntry(user_id=user.id, content=content, entry_date=entry_date)
     db.add(entry)
     db.commit()
     db.refresh(entry)
@@ -449,8 +468,7 @@ def risk_history(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> List[RiskHistoryEntry]:
-    start_date = datetime.utcnow().date() - timedelta(days=days - 1)
-    start_dt = datetime.combine(start_date, datetime.min.time())
+    start_date = date.today() - timedelta(days=days - 1)
 
     answers = (
         db.query(Answer, Question)
@@ -458,29 +476,31 @@ def risk_history(
         .filter(
             Answer.user_id == user.id,
             Question.kind == "daily",
-            Answer.created_at >= start_dt,
+            Answer.entry_date.isnot(None),
+            Answer.entry_date >= start_date,
         )
-        .order_by(Answer.created_at.desc())
+        .order_by(Answer.entry_date.asc(), Answer.created_at.desc())
         .all()
     )
     journals = (
         db.query(JournalEntry)
         .filter(
             JournalEntry.user_id == user.id,
-            JournalEntry.created_at >= start_dt,
+            JournalEntry.entry_date.isnot(None),
+            JournalEntry.entry_date >= start_date,
         )
-        .order_by(JournalEntry.created_at.desc())
+        .order_by(JournalEntry.entry_date.asc(), JournalEntry.created_at.desc())
         .all()
     )
 
     answers_by_date: dict[date, List[tuple[Answer, Question]]] = {}
     for answer, question in answers:
-        day = answer.created_at.date()
+        day = answer.entry_date
         answers_by_date.setdefault(day, []).append((answer, question))
 
     journals_by_date: dict[date, JournalEntry] = {}
     for entry in journals:
-        day = entry.created_at.date()
+        day = entry.entry_date
         if day not in journals_by_date:
             journals_by_date[day] = entry
 
