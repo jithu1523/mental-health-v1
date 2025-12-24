@@ -56,3 +56,8 @@ The Streamlit app uses `http://127.0.0.1:8000` by default.
 
 - `SECRET_KEY` in `mindtriage/backend/app/main.py` is set to `CHANGE_ME`. Update before real use.
 - The SQLite database file `mindtriage.db` is created locally on first run.
+
+## Drift tracking
+
+- Daily check-ins and journals feed a simple risk score.
+- The app plots recent scores in a trend chart using `/risk/history`.

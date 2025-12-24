@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import random
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import List, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
@@ -114,6 +114,12 @@ class RiskResponse(BaseModel):
     score: int
     reasons: List[str]
     last_journal_excerpt: Optional[str]
+
+
+class RiskHistoryEntry(BaseModel):
+    date: str
+    score: int
+    level: str
 
 
 app = FastAPI(title="MindTriage API")
@@ -428,6 +434,70 @@ def risk_latest(
         .first()
     )
 
+    risk_level, score, reasons, excerpt = compute_risk_details(answers, last_journal)
+    return RiskResponse(
+        risk_level=risk_level,
+        score=score,
+        reasons=reasons,
+        last_journal_excerpt=excerpt,
+    )
+
+
+@app.get("/risk/history", response_model=List[RiskHistoryEntry])
+def risk_history(
+    days: int = Query(30, ge=1, le=365),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> List[RiskHistoryEntry]:
+    start_date = datetime.utcnow().date() - timedelta(days=days - 1)
+    start_dt = datetime.combine(start_date, datetime.min.time())
+
+    answers = (
+        db.query(Answer, Question)
+        .join(Question, Answer.question_id == Question.id)
+        .filter(
+            Answer.user_id == user.id,
+            Question.kind == "daily",
+            Answer.created_at >= start_dt,
+        )
+        .order_by(Answer.created_at.desc())
+        .all()
+    )
+    journals = (
+        db.query(JournalEntry)
+        .filter(
+            JournalEntry.user_id == user.id,
+            JournalEntry.created_at >= start_dt,
+        )
+        .order_by(JournalEntry.created_at.desc())
+        .all()
+    )
+
+    answers_by_date: dict[date, List[tuple[Answer, Question]]] = {}
+    for answer, question in answers:
+        day = answer.created_at.date()
+        answers_by_date.setdefault(day, []).append((answer, question))
+
+    journals_by_date: dict[date, JournalEntry] = {}
+    for entry in journals:
+        day = entry.created_at.date()
+        if day not in journals_by_date:
+            journals_by_date[day] = entry
+
+    all_days = sorted(set(answers_by_date.keys()) | set(journals_by_date.keys()))
+    history: List[RiskHistoryEntry] = []
+    for day in all_days:
+        day_answers = answers_by_date.get(day, [])
+        day_journal = journals_by_date.get(day)
+        risk_level, score, _, _ = compute_risk_details(day_answers, day_journal)
+        history.append(RiskHistoryEntry(date=day.isoformat(), score=score, level=risk_level))
+    return history
+
+
+def compute_risk_details(
+    answers: List[tuple[Answer, Question]],
+    last_journal: Optional[JournalEntry],
+) -> tuple[str, int, List[str], Optional[str]]:
     score = 0
     reasons: List[str] = []
     for answer, question in answers:
@@ -461,12 +531,7 @@ def risk_latest(
     else:
         risk_level = "low"
 
-    return RiskResponse(
-        risk_level=risk_level,
-        score=score,
-        reasons=list(dict.fromkeys(reasons)),
-        last_journal_excerpt=excerpt,
-    )
+    return risk_level, score, list(dict.fromkeys(reasons)), excerpt
 
 
 def indicates_hopeless(text: str) -> bool:

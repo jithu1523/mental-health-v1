@@ -1,3 +1,4 @@
+import altair as alt
 import requests
 import streamlit as st
 
@@ -239,5 +240,33 @@ with care_tab:
                 st.write(excerpt)
         elif risk_resp is not None:
             st.error(risk_resp.json().get("detail", "Unable to load risk status."))
+
+        st.subheader("Risk Trend")
+        history_resp = api_get("/risk/history")
+        if history_resp is not None and history_resp.ok:
+            history = safe_json(history_resp) or []
+            if len(history) < 3:
+                st.info("Add more daily check-ins to see trends.")
+            else:
+                max_score = max(item.get("score", 0) for item in history)
+                chart_max = max(20, max_score + 2)
+                band_data = [
+                    {"ymin": 0, "ymax": 8, "color": "#dff3df"},
+                    {"ymin": 9, "ymax": 17, "color": "#fff2cc"},
+                    {"ymin": 18, "ymax": chart_max, "color": "#ffe1e1"},
+                ]
+                band_chart = alt.Chart(band_data).mark_rect(opacity=0.4).encode(
+                    y=alt.Y("ymin:Q", title="Risk score", scale=alt.Scale(domain=[0, chart_max])),
+                    y2="ymax:Q",
+                    color=alt.Color("color:N", scale=None, legend=None),
+                )
+                line_chart = alt.Chart(history).mark_line(point=True).encode(
+                    x=alt.X("date:T", title="Date"),
+                    y=alt.Y("score:Q", scale=alt.Scale(domain=[0, chart_max])),
+                    tooltip=["date:T", "score:Q", "level:N"],
+                )
+                st.altair_chart(band_chart + line_chart, use_container_width=True)
+        elif history_resp is not None:
+            show_response_error(history_resp, "/risk/history", "Unable to load risk history.")
 
 st.caption("Not a diagnosis. If you feel unsafe contact local emergency services.")
