@@ -85,4 +85,4 @@ The Streamlit app uses `http://127.0.0.1:8000` by default.
 
 - Daily check-ins and journals feed a simple risk score.
 - The app plots recent scores in a trend chart using `/risk/history`.
-- For demos, you can backdate check-ins and journal entries with `entry_date` (YYYY-MM-DD) to generate a trend quickly.
+- For demos, you can backdate check-ins and journal entries with `entry_date` (YYYY-MM-DD) to generate a trend quickly (dev mode only).

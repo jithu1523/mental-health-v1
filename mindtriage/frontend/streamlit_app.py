@@ -186,7 +186,10 @@ with care_tab:
             st.stop()
 
         st.subheader("Daily check-in")
-        selected_checkin_date = st.date_input("Check-in date", value=date.today())
+        selected_checkin_date = date.today()
+        if st.session_state.dev_mode:
+            st.caption("Dev mode: date controls enabled.")
+            selected_checkin_date = st.date_input("Check-in date", value=date.today())
         if st.button("Load daily questions") or st.session_state.daily_questions is None:
             pick_resp = api_get("/daily/pick")
             if pick_resp is not None and pick_resp.ok:
@@ -223,7 +226,10 @@ with care_tab:
                         st.error(resp.json().get("detail", "Unable to save daily answers."))
 
         st.subheader("Journal")
-        selected_journal_date = st.date_input("Journal date", value=date.today(), key="journal_date")
+        selected_journal_date = date.today()
+        if st.session_state.dev_mode:
+            st.caption("Dev mode: date controls enabled.")
+            selected_journal_date = st.date_input("Journal date", value=date.today(), key="journal_date")
         journal_text = st.text_area("Write a short entry", height=140)
         if st.button("Save journal entry"):
             if not journal_text.strip():
@@ -338,7 +344,10 @@ with rapid_tab:
     if not st.session_state.token:
         st.warning("Sign in on the Account tab to continue.")
     else:
-        rapid_date = st.date_input("Evaluation date", value=date.today(), key="rapid_date")
+        rapid_date = date.today()
+        if st.session_state.dev_mode:
+            st.caption("Dev mode: date controls enabled.")
+            rapid_date = st.date_input("Evaluation date", value=date.today(), key="rapid_date")
         questions_resp = api_get("/rapid/questions")
         if questions_resp is None:
             st.stop()

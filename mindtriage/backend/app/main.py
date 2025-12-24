@@ -578,9 +578,20 @@ def submit_answers(
     if missing:
         raise HTTPException(status_code=400, detail=f"Unknown question IDs: {missing}")
 
+    today = date.today()
+    if not is_dev_mode():
+        for item in payload.answers:
+            if item.entry_date and item.entry_date != today:
+                raise HTTPException(
+                    status_code=400,
+                    detail="entry_date must be today unless dev mode is enabled.",
+                )
+
     created = []
     for item in payload.answers:
-        entry_date = item.entry_date or date.today()
+        entry_date = item.entry_date or today
+        if not is_dev_mode():
+            entry_date = today
         created.append(Answer(
             user_id=user.id,
             question_id=item.question_id,
@@ -601,7 +612,15 @@ def create_journal_entry(
     content = payload.content.strip()
     if not content:
         raise HTTPException(status_code=400, detail="Journal content cannot be empty")
-    entry_date = payload.entry_date or date.today()
+    today = date.today()
+    entry_date = payload.entry_date or today
+    if not is_dev_mode():
+        if payload.entry_date and payload.entry_date != today:
+            raise HTTPException(
+                status_code=400,
+                detail="entry_date must be today unless dev mode is enabled.",
+            )
+        entry_date = today
     entry = JournalEntry(user_id=user.id, content=content, entry_date=entry_date)
     db.add(entry)
     db.commit()
@@ -780,7 +799,15 @@ def rapid_start(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> RapidStartResponse:
-    entry_date = payload.entry_date or date.today()
+    today = date.today()
+    entry_date = payload.entry_date or today
+    if not is_dev_mode():
+        if payload.entry_date and payload.entry_date != today:
+            raise HTTPException(
+                status_code=400,
+                detail="entry_date must be today unless dev mode is enabled.",
+            )
+        entry_date = today
     now = datetime.utcnow()
 
     evaluation = RapidEvaluation(
@@ -876,7 +903,15 @@ def rapid_submit(
         answers_by_slug[question["slug"]] = answer.answer_text.strip()
 
     level, score, signals, explanations, actions, crisis = compute_rapid_risk(answers_by_slug)
-    entry_date = payload.entry_date or (active_session.entry_date if active_session else date.today())
+    today = date.today()
+    entry_date = payload.entry_date or (active_session.entry_date if active_session else today)
+    if not is_dev_mode():
+        if payload.entry_date and payload.entry_date != today:
+            raise HTTPException(
+                status_code=400,
+                detail="entry_date must be today unless dev mode is enabled.",
+            )
+        entry_date = today
     started_at = active_session.started_at if active_session else (payload.started_at or now)
     submitted_at = now
     time_taken_seconds = (submitted_at - started_at).total_seconds() if started_at else 0.0
