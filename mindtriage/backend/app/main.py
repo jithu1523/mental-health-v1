@@ -11,7 +11,7 @@ from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel
-from sqlalchemy import Column, Date, DateTime, ForeignKey, Integer, String, create_engine, func, text
+from sqlalchemy import Boolean, Column, Date, DateTime, ForeignKey, Integer, String, create_engine, func, text, or_
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import Session, relationship, sessionmaker
 
@@ -59,10 +59,14 @@ class RapidEvaluation(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     entry_date = Column(Date, default=date.today, nullable=True)
+    started_at = Column(DateTime, nullable=True)
+    submitted_at = Column(DateTime, nullable=True)
     answers_json = Column(String, nullable=False)
     score = Column(Integer, nullable=False)
     level = Column(String, nullable=False)
     signals_json = Column(String, nullable=False)
+    is_valid = Column(Boolean, default=True, nullable=False)
+    quality_flags_json = Column(String, nullable=False, default="[]")
 
 
 class Question(Base):
@@ -156,6 +160,7 @@ class RapidAnswer(BaseModel):
 
 class RapidSubmitRequest(BaseModel):
     entry_date: Optional[date] = None
+    started_at: Optional[datetime] = None
     answers: List[RapidAnswer]
 
 
@@ -165,6 +170,8 @@ class RapidSubmitResponse(BaseModel):
     signals: List[str]
     recommended_actions: List[str]
     crisis_guidance: Optional[List[str]] = None
+    is_valid: bool
+    quality_flags: List[str]
     entry_date: str
 
 
@@ -276,6 +283,14 @@ RAPID_QUESTIONS = [
         "kind": "rapid",
         "format": "yesno",
     },
+    {
+        "id": 11,
+        "slug": "rapid_attention_check",
+        "text": "Attention check: select 'Sometimes' for this item.",
+        "kind": "rapid",
+        "format": "choice",
+        "choices": ["Never", "Sometimes", "Often"],
+    },
 ]
 
 
@@ -283,6 +298,7 @@ RAPID_QUESTIONS = [
 def on_startup() -> None:
     Base.metadata.create_all(bind=engine)
     ensure_entry_date_columns()
+    ensure_rapid_columns()
     seed_questions()
 
 
@@ -310,6 +326,21 @@ def ensure_entry_date_columns() -> None:
         if "entry_date" not in journal_columns:
             connection.execute(text("ALTER TABLE journal_entries ADD COLUMN entry_date DATE"))
         connection.commit()
+
+
+def ensure_rapid_columns() -> None:
+    with engine.connect() as connection:
+        columns = {row[1] for row in connection.execute(text("PRAGMA table_info(rapid_evaluations)"))}
+        if columns:
+            if "started_at" not in columns:
+                connection.execute(text("ALTER TABLE rapid_evaluations ADD COLUMN started_at DATETIME"))
+            if "submitted_at" not in columns:
+                connection.execute(text("ALTER TABLE rapid_evaluations ADD COLUMN submitted_at DATETIME"))
+            if "is_valid" not in columns:
+                connection.execute(text("ALTER TABLE rapid_evaluations ADD COLUMN is_valid BOOLEAN DEFAULT 1"))
+            if "quality_flags_json" not in columns:
+                connection.execute(text("ALTER TABLE rapid_evaluations ADD COLUMN quality_flags_json TEXT DEFAULT '[]'"))
+            connection.commit()
 
 
 def get_db() -> Session:
@@ -705,6 +736,36 @@ def rapid_submit(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> RapidSubmitResponse:
+    now = datetime.utcnow()
+    last_eval = (
+        db.query(RapidEvaluation)
+        .filter(RapidEvaluation.user_id == user.id)
+        .order_by(func.coalesce(RapidEvaluation.submitted_at, RapidEvaluation.created_at).desc())
+        .first()
+    )
+    if last_eval:
+        last_time = last_eval.submitted_at or last_eval.created_at
+        if last_time and (now - last_time) < timedelta(minutes=5):
+            raise HTTPException(
+                status_code=429,
+                detail="Please wait at least 5 minutes between rapid evaluations.",
+            )
+
+    cutoff = now - timedelta(hours=24)
+    recent_count = (
+        db.query(RapidEvaluation)
+        .filter(
+            RapidEvaluation.user_id == user.id,
+            func.coalesce(RapidEvaluation.submitted_at, RapidEvaluation.created_at) >= cutoff,
+        )
+        .count()
+    )
+    if recent_count >= 3:
+        raise HTTPException(
+            status_code=429,
+            detail="Daily limit reached (3 rapid evaluations in 24 hours). Please try again later.",
+        )
+
     if not payload.answers:
         raise HTTPException(status_code=400, detail="No answers provided")
 
@@ -718,14 +779,39 @@ def rapid_submit(
 
     level, score, signals, actions, crisis = compute_rapid_risk(answers_by_slug)
     entry_date = payload.entry_date or date.today()
+    started_at = payload.started_at or now
+    submitted_at = now
+
+    quality_flags: List[str] = []
+    if payload.started_at and (submitted_at - started_at).total_seconds() < 25:
+        quality_flags.append("too_fast")
+    attention = answers_by_slug.get("rapid_attention_check", "")
+    if attention.strip().lower() != "sometimes":
+        quality_flags.append("failed_attention_check")
+
+    answers_payload = json.dumps(answers_by_slug, sort_keys=True)
+    last_valid = (
+        db.query(RapidEvaluation)
+        .filter(RapidEvaluation.user_id == user.id, RapidEvaluation.is_valid.is_(True))
+        .order_by(func.coalesce(RapidEvaluation.submitted_at, RapidEvaluation.created_at).desc())
+        .first()
+    )
+    if last_valid and last_valid.answers_json == answers_payload:
+        quality_flags.append("duplicate_answers")
+
+    is_valid = len(quality_flags) == 0
 
     evaluation = RapidEvaluation(
         user_id=user.id,
         entry_date=entry_date,
-        answers_json=json.dumps(answers_by_slug),
+        started_at=started_at,
+        submitted_at=submitted_at,
+        answers_json=answers_payload,
         score=score,
         level=level,
         signals_json=json.dumps(signals),
+        is_valid=is_valid,
+        quality_flags_json=json.dumps(quality_flags),
     )
     db.add(evaluation)
     db.commit()
@@ -736,6 +822,8 @@ def rapid_submit(
         signals=signals,
         recommended_actions=actions,
         crisis_guidance=crisis,
+        is_valid=is_valid,
+        quality_flags=quality_flags,
         entry_date=entry_date.isoformat(),
     )
 
@@ -743,20 +831,25 @@ def rapid_submit(
 @app.get("/rapid/history", response_model=List[RiskHistoryEntry])
 def rapid_history(
     days: int = Query(30, ge=1, le=365),
+    include_invalid: bool = Query(False),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> List[RiskHistoryEntry]:
     start_date = date.today() - timedelta(days=days - 1)
-    evaluations = (
+    query = (
         db.query(RapidEvaluation)
         .filter(
             RapidEvaluation.user_id == user.id,
             RapidEvaluation.entry_date.isnot(None),
             RapidEvaluation.entry_date >= start_date,
         )
-        .order_by(RapidEvaluation.entry_date.asc(), RapidEvaluation.created_at.desc())
-        .all()
     )
+    if not include_invalid:
+        query = query.filter(or_(RapidEvaluation.is_valid.is_(True), RapidEvaluation.is_valid.is_(None)))
+    evaluations = query.order_by(
+        RapidEvaluation.entry_date.asc(),
+        RapidEvaluation.created_at.desc(),
+    ).all()
 
     by_date: dict[date, RapidEvaluation] = {}
     for evaluation in evaluations:

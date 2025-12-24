@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime
 
 import altair as alt
 import requests
@@ -12,6 +12,8 @@ if "token" not in st.session_state:
     st.session_state.token = None
 if "daily_questions" not in st.session_state:
     st.session_state.daily_questions = None
+if "rapid_started_at" not in st.session_state:
+    st.session_state.rapid_started_at = None
 
 
 def api_headers() -> dict:
@@ -304,6 +306,9 @@ with rapid_tab:
             st.info("No rapid questions available.")
             st.stop()
 
+        if st.session_state.rapid_started_at is None:
+            st.session_state.rapid_started_at = datetime.utcnow().isoformat()
+
         with st.form("rapid_form"):
             rapid_answers = []
             for question in questions:
@@ -323,19 +328,32 @@ with rapid_tab:
                     answer_text = st.text_input(qtext, key=f"rapid_{qid}")
                 rapid_answers.append({"question_id": qid, "answer_text": answer_text})
             if st.form_submit_button("Submit rapid evaluation"):
-                payload = {"entry_date": rapid_date.isoformat(), "answers": rapid_answers}
+                payload = {
+                    "entry_date": rapid_date.isoformat(),
+                    "started_at": st.session_state.rapid_started_at,
+                    "answers": rapid_answers,
+                }
                 resp = api_post("/rapid/submit", json=payload)
                 if resp is not None and resp.ok:
                     st.session_state.rapid_result = safe_json(resp) or {}
+                    st.session_state.rapid_started_at = None
                     st.success("Rapid evaluation saved.")
                 elif resp is not None:
-                    show_response_error(resp, "/rapid/submit", "Rapid evaluation failed.")
+                    if resp.status_code == 429:
+                        detail = (safe_json(resp) or {}).get("detail", resp.text)
+                        st.warning(detail)
+                    else:
+                        show_response_error(resp, "/rapid/submit", "Rapid evaluation failed.")
 
         result = st.session_state.get("rapid_result")
         if result:
             st.subheader("Rapid results")
             st.metric("Risk level", result.get("level", "unknown"))
             st.write("Score:", result.get("score", 0))
+            if result.get("is_valid") is False:
+                flags = result.get("quality_flags", [])
+                flag_text = ", ".join(flags) if flags else "quality flags"
+                st.info(f"This evaluation wasn't counted because: {flag_text}")
             signals = result.get("signals", [])
             if signals:
                 st.write("Top signals:", ", ".join(signals))
