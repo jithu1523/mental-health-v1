@@ -161,6 +161,7 @@ class RapidAnswer(BaseModel):
 class RapidSubmitRequest(BaseModel):
     entry_date: Optional[date] = None
     started_at: Optional[datetime] = None
+    session_id: Optional[int] = None
     answers: List[RapidAnswer]
 
 
@@ -172,6 +173,16 @@ class RapidSubmitResponse(BaseModel):
     crisis_guidance: Optional[List[str]] = None
     is_valid: bool
     quality_flags: List[str]
+    entry_date: str
+
+
+class RapidStartRequest(BaseModel):
+    entry_date: Optional[date] = None
+
+
+class RapidStartResponse(BaseModel):
+    session_id: int
+    started_at: str
     entry_date: str
 
 
@@ -730,6 +741,37 @@ def rapid_questions() -> List[RapidQuestion]:
     return [RapidQuestion(**question) for question in RAPID_QUESTIONS]
 
 
+@app.post("/rapid/start", response_model=RapidStartResponse)
+def rapid_start(
+    payload: RapidStartRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> RapidStartResponse:
+    entry_date = payload.entry_date or date.today()
+    now = datetime.utcnow()
+
+    evaluation = RapidEvaluation(
+        user_id=user.id,
+        started_at=now,
+        entry_date=entry_date,
+        answers_json="{}",
+        score=0,
+        level="PENDING",
+        signals_json="[]",
+        is_valid=True,
+        quality_flags_json="[]",
+    )
+    db.add(evaluation)
+    db.commit()
+    db.refresh(evaluation)
+
+    return RapidStartResponse(
+        session_id=evaluation.id,
+        started_at=now.isoformat(),
+        entry_date=entry_date.isoformat(),
+    )
+
+
 @app.post("/rapid/submit", response_model=RapidSubmitResponse)
 def rapid_submit(
     payload: RapidSubmitRequest,
@@ -739,13 +781,12 @@ def rapid_submit(
     now = datetime.utcnow()
     last_eval = (
         db.query(RapidEvaluation)
-        .filter(RapidEvaluation.user_id == user.id)
-        .order_by(func.coalesce(RapidEvaluation.submitted_at, RapidEvaluation.created_at).desc())
+        .filter(RapidEvaluation.user_id == user.id, RapidEvaluation.submitted_at.isnot(None))
+        .order_by(RapidEvaluation.submitted_at.desc())
         .first()
     )
     if last_eval:
-        last_time = last_eval.submitted_at or last_eval.created_at
-        if last_time and (now - last_time) < timedelta(minutes=5):
+        if last_eval.submitted_at and (now - last_eval.submitted_at) < timedelta(minutes=5):
             raise HTTPException(
                 status_code=429,
                 detail="Please wait at least 5 minutes between rapid evaluations.",
@@ -756,7 +797,8 @@ def rapid_submit(
         db.query(RapidEvaluation)
         .filter(
             RapidEvaluation.user_id == user.id,
-            func.coalesce(RapidEvaluation.submitted_at, RapidEvaluation.created_at) >= cutoff,
+            RapidEvaluation.submitted_at.isnot(None),
+            RapidEvaluation.submitted_at >= cutoff,
         )
         .count()
     )
@@ -769,6 +811,20 @@ def rapid_submit(
     if not payload.answers:
         raise HTTPException(status_code=400, detail="No answers provided")
 
+    active_session = None
+    if payload.session_id is not None:
+        active_session = (
+            db.query(RapidEvaluation)
+            .filter(
+                RapidEvaluation.id == payload.session_id,
+                RapidEvaluation.user_id == user.id,
+                RapidEvaluation.submitted_at.is_(None),
+            )
+            .first()
+        )
+        if not active_session:
+            raise HTTPException(status_code=400, detail="Invalid or expired rapid session.")
+
     question_lookup = {q["id"]: q for q in RAPID_QUESTIONS}
     answers_by_slug: dict[str, str] = {}
     for answer in payload.answers:
@@ -778,12 +834,12 @@ def rapid_submit(
         answers_by_slug[question["slug"]] = answer.answer_text.strip()
 
     level, score, signals, actions, crisis = compute_rapid_risk(answers_by_slug)
-    entry_date = payload.entry_date or date.today()
-    started_at = payload.started_at or now
+    entry_date = payload.entry_date or (active_session.entry_date if active_session else date.today())
+    started_at = active_session.started_at if active_session else (payload.started_at or now)
     submitted_at = now
 
     quality_flags: List[str] = []
-    if payload.started_at and (submitted_at - started_at).total_seconds() < 25:
+    if started_at and (submitted_at - started_at).total_seconds() < 25:
         quality_flags.append("too_fast")
     attention = answers_by_slug.get("rapid_attention_check", "")
     if attention.strip().lower() != "sometimes":
@@ -792,7 +848,11 @@ def rapid_submit(
     answers_payload = json.dumps(answers_by_slug, sort_keys=True)
     last_valid = (
         db.query(RapidEvaluation)
-        .filter(RapidEvaluation.user_id == user.id, RapidEvaluation.is_valid.is_(True))
+        .filter(
+            RapidEvaluation.user_id == user.id,
+            RapidEvaluation.is_valid.is_(True),
+            RapidEvaluation.submitted_at.isnot(None),
+        )
         .order_by(func.coalesce(RapidEvaluation.submitted_at, RapidEvaluation.created_at).desc())
         .first()
     )
@@ -801,19 +861,30 @@ def rapid_submit(
 
     is_valid = len(quality_flags) == 0
 
-    evaluation = RapidEvaluation(
-        user_id=user.id,
-        entry_date=entry_date,
-        started_at=started_at,
-        submitted_at=submitted_at,
-        answers_json=answers_payload,
-        score=score,
-        level=level,
-        signals_json=json.dumps(signals),
-        is_valid=is_valid,
-        quality_flags_json=json.dumps(quality_flags),
-    )
-    db.add(evaluation)
+    if active_session:
+        active_session.entry_date = entry_date
+        active_session.started_at = started_at
+        active_session.submitted_at = submitted_at
+        active_session.answers_json = answers_payload
+        active_session.score = score
+        active_session.level = level
+        active_session.signals_json = json.dumps(signals)
+        active_session.is_valid = is_valid
+        active_session.quality_flags_json = json.dumps(quality_flags)
+    else:
+        evaluation = RapidEvaluation(
+            user_id=user.id,
+            entry_date=entry_date,
+            started_at=started_at,
+            submitted_at=submitted_at,
+            answers_json=answers_payload,
+            score=score,
+            level=level,
+            signals_json=json.dumps(signals),
+            is_valid=is_valid,
+            quality_flags_json=json.dumps(quality_flags),
+        )
+        db.add(evaluation)
     db.commit()
 
     return RapidSubmitResponse(
@@ -842,6 +913,7 @@ def rapid_history(
             RapidEvaluation.user_id == user.id,
             RapidEvaluation.entry_date.isnot(None),
             RapidEvaluation.entry_date >= start_date,
+            RapidEvaluation.submitted_at.isnot(None),
         )
     )
     if not include_invalid:

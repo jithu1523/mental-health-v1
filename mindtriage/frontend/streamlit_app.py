@@ -1,4 +1,4 @@
-from datetime import date, datetime
+from datetime import date
 
 import altair as alt
 import pandas as pd
@@ -13,8 +13,10 @@ if "token" not in st.session_state:
     st.session_state.token = None
 if "daily_questions" not in st.session_state:
     st.session_state.daily_questions = None
-if "rapid_started_at" not in st.session_state:
-    st.session_state.rapid_started_at = None
+if "rapid_session_id" not in st.session_state:
+    st.session_state.rapid_session_id = None
+if "rapid_session_date" not in st.session_state:
+    st.session_state.rapid_session_date = None
 
 
 def api_headers() -> dict:
@@ -311,8 +313,19 @@ with rapid_tab:
             st.info("No rapid questions available.")
             st.stop()
 
-        if st.session_state.rapid_started_at is None:
-            st.session_state.rapid_started_at = datetime.utcnow().isoformat()
+        if (
+            st.session_state.rapid_session_id is None
+            or st.session_state.rapid_session_date != rapid_date.isoformat()
+        ):
+            start_resp = api_post("/rapid/start", json={"entry_date": rapid_date.isoformat()})
+            if start_resp is None:
+                st.stop()
+            if not start_resp.ok:
+                show_response_error(start_resp, "/rapid/start", "Unable to start rapid evaluation.")
+                st.stop()
+            start_payload = safe_json(start_resp) or {}
+            st.session_state.rapid_session_id = start_payload.get("session_id")
+            st.session_state.rapid_session_date = rapid_date.isoformat()
 
         with st.form("rapid_form"):
             rapid_answers = []
@@ -335,13 +348,14 @@ with rapid_tab:
             if st.form_submit_button("Submit rapid evaluation"):
                 payload = {
                     "entry_date": rapid_date.isoformat(),
-                    "started_at": st.session_state.rapid_started_at,
+                    "session_id": st.session_state.rapid_session_id,
                     "answers": rapid_answers,
                 }
                 resp = api_post("/rapid/submit", json=payload)
                 if resp is not None and resp.ok:
                     st.session_state.rapid_result = safe_json(resp) or {}
-                    st.session_state.rapid_started_at = None
+                    st.session_state.rapid_session_id = None
+                    st.session_state.rapid_session_date = None
                     st.success("Rapid evaluation saved.")
                 elif resp is not None:
                     if resp.status_code == 429:
