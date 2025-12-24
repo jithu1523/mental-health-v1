@@ -229,7 +229,20 @@ def register_user(payload: RegisterRequest, db: Session = Depends(get_db)) -> To
     existing = db.query(User).filter(User.email == payload.email).first()
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
-    user = User(email=payload.email, hashed_password=get_password_hash(payload.password))
+    password_bytes = payload.password.encode("utf-8")
+    if len(password_bytes) > 72:
+        raise HTTPException(
+            status_code=400,
+            detail="Password too long (bcrypt limit is 72 bytes). Use a shorter password.",
+        )
+    try:
+        hashed_password = get_password_hash(payload.password)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to process password at this time.",
+        ) from exc
+    user = User(email=payload.email, hashed_password=hashed_password)
     db.add(user)
     db.commit()
     db.refresh(user)
