@@ -82,8 +82,9 @@ st.caption("Not a diagnosis. If you feel unsafe contact local emergency services
 
 rapid_tab_label = "Rapid Evaluation"
 export_tab_label = "Export"
-login_tab, care_tab, rapid_tab, export_tab = st.tabs(
-    ["Account", "Check-in & Journal", rapid_tab_label, export_tab_label]
+methods_tab_label = "Methods + Metrics"
+login_tab, care_tab, rapid_tab, export_tab, methods_tab = st.tabs(
+    ["Account", "Check-in & Journal", rapid_tab_label, export_tab_label, methods_tab_label]
 )
 
 st.subheader("Backend connection check")
@@ -505,3 +506,83 @@ with export_tab:
                 file_name="mindtriage_export.zip",
                 mime="application/zip",
             )
+
+with methods_tab:
+    st.subheader("Methods + Metrics")
+    st.caption("Not a diagnosis. If you feel unsafe contact local emergency services.")
+    if not st.session_state.token:
+        st.warning("Sign in on the Account tab to continue.")
+    else:
+        metrics_resp = api_get("/metrics/summary?days=30")
+        if metrics_resp is None:
+            st.stop()
+        if not metrics_resp.ok:
+            show_response_error(metrics_resp, "/metrics/summary", "Unable to load metrics.")
+            st.stop()
+        metrics = safe_json(metrics_resp) or {}
+        regular = metrics.get("regular", {})
+        rapid = metrics.get("rapid", {})
+        safety = metrics.get("safety", {})
+
+        st.subheader("Regular")
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Check-ins", regular.get("count_checkins", 0))
+        col2.metric("Missing days", regular.get("missing_days", 0))
+        col3.metric("Mean score", regular.get("mean_score", 0))
+        col4, col5, col6 = st.columns(3)
+        col4.metric("Median score", regular.get("median_score", 0))
+        col5.metric("Std score", regular.get("std_score", 0))
+        col6.metric("Trend slope (14d)", regular.get("trend_slope_14d", 0))
+
+        st.subheader("Rapid")
+        rcol1, rcol2, rcol3 = st.columns(3)
+        rcol1.metric("Total", rapid.get("count_total", 0))
+        rcol2.metric("Valid", rapid.get("count_valid", 0))
+        rcol3.metric("Invalid", rapid.get("count_invalid", 0))
+        rcol4, rcol5, rcol6 = st.columns(3)
+        rcol4.metric("Mean time (s)", rapid.get("mean_time_seconds_valid", 0))
+        rcol5.metric("High confidence", rapid.get("confidence_counts", {}).get("high", 0))
+        rcol6.metric("RED count", rapid.get("level_counts", {}).get("red", 0))
+
+        level_counts = rapid.get("level_counts", {})
+        if level_counts:
+            level_df = pd.DataFrame(
+                [{"level": key, "count": value} for key, value in level_counts.items()]
+            )
+            level_chart = alt.Chart(level_df).mark_bar().encode(
+                x=alt.X("level:N", title="Level"),
+                y=alt.Y("count:Q", title="Count"),
+            )
+            st.altair_chart(level_chart, use_container_width=True)
+
+        invalid_counts = rapid.get("invalid_reason_counts", {})
+        if invalid_counts:
+            invalid_df = pd.DataFrame(
+                [{"reason": key, "count": value} for key, value in invalid_counts.items()]
+            )
+            invalid_chart = alt.Chart(invalid_df).mark_bar().encode(
+                x=alt.X("reason:N", title="Invalid reason"),
+                y=alt.Y("count:Q", title="Count"),
+            )
+            st.altair_chart(invalid_chart, use_container_width=True)
+
+        st.subheader("Safety")
+        scol1, scol2, scol3 = st.columns(3)
+        scol1.metric("RED triggers", safety.get("red_trigger_count", 0))
+        scol2.metric("RED + low confidence", safety.get("red_low_confidence_count", 0))
+        scol3.metric("Escalations shown", safety.get("escalation_shown_count", 0))
+
+        st.subheader("Copy for paper")
+        total = rapid.get("count_total", 0)
+        invalid = rapid.get("count_invalid", 0)
+        invalid_pct = (invalid / total * 100) if total else 0
+        invalid_reasons = ", ".join(
+            f"{key} ({value})" for key, value in (invalid_counts or {}).items()
+        ) or "none"
+        paper_text = (
+            f"In 30 days, {total} rapid evaluations were recorded; "
+            f"{invalid_pct:.1f}% were invalid due to {invalid_reasons}. "
+            f"Regular check-ins: {regular.get('count_checkins', 0)} completed; "
+            f"mean score {regular.get('mean_score', 0)}."
+        )
+        st.code(paper_text, language="text")

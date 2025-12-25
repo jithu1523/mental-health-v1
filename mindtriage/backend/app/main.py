@@ -8,6 +8,7 @@ import random
 import zipfile
 from datetime import date, datetime, timedelta
 from hashlib import sha256
+import statistics
 from typing import List, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
@@ -1250,6 +1251,23 @@ def export_anonymized_self_check(
     return {"pii_detected": pii_detected, "bytes": len(export_bytes)}
 
 
+@app.get("/metrics/summary")
+def metrics_summary(
+    days: int = Query(30, ge=1, le=365),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    start_date = date.today() - timedelta(days=days - 1)
+    regular_summary = build_regular_metrics(user.id, db, start_date, days)
+    rapid_summary = build_rapid_metrics(user.id, db, start_date)
+    safety_summary = build_safety_metrics(user.id, db, start_date)
+    return {
+        "regular": regular_summary,
+        "rapid": rapid_summary,
+        "safety": safety_summary,
+    }
+
+
 def compute_rapid_risk(
     answers_by_slug: dict[str, str]
 ) -> tuple[str, int, List[str], List[RapidExplainabilityItem], List[str], Optional[List[str]]]:
@@ -1623,3 +1641,169 @@ def build_journal_rows(
             row["text"] = entry.content
         rows.append(row)
     return rows
+
+
+def build_regular_metrics(user_id: int, db: Session, start_date: date, days: int) -> dict:
+    daily_scores = []
+    scores_by_day: dict[date, int] = {}
+
+    answers = (
+        db.query(Answer, Question)
+        .join(Question, Answer.question_id == Question.id)
+        .filter(
+            Answer.user_id == user_id,
+            Question.kind == "daily",
+            Answer.entry_date.isnot(None),
+            Answer.entry_date >= start_date,
+        )
+        .order_by(Answer.entry_date.asc(), Answer.created_at.desc())
+        .all()
+    )
+    journals = (
+        db.query(JournalEntry)
+        .filter(
+            JournalEntry.user_id == user_id,
+            JournalEntry.entry_date.isnot(None),
+            JournalEntry.entry_date >= start_date,
+        )
+        .order_by(JournalEntry.entry_date.asc(), JournalEntry.created_at.desc())
+        .all()
+    )
+
+    answers_by_date: dict[date, List[tuple[Answer, Question]]] = {}
+    for answer, question in answers:
+        answers_by_date.setdefault(answer.entry_date, []).append((answer, question))
+
+    journals_by_date: dict[date, JournalEntry] = {}
+    for entry in journals:
+        if entry.entry_date not in journals_by_date:
+            journals_by_date[entry.entry_date] = entry
+
+    all_days = sorted(set(answers_by_date.keys()) | set(journals_by_date.keys()))
+    for day in all_days:
+        _, score, _, _ = compute_risk_details(
+            answers_by_date.get(day, []),
+            journals_by_date.get(day),
+        )
+        scores_by_day[day] = score
+        daily_scores.append(score)
+
+    count_checkins = len(all_days)
+    missing_days = max(0, days - count_checkins)
+    mean_score = statistics.mean(daily_scores) if daily_scores else 0.0
+    median_score = statistics.median(daily_scores) if daily_scores else 0.0
+    std_score = statistics.pstdev(daily_scores) if len(daily_scores) >= 2 else 0.0
+
+    trend_slope_14d = compute_trend_slope(scores_by_day, lookback_days=14)
+
+    return {
+        "count_checkins": count_checkins,
+        "missing_days": missing_days,
+        "mean_score": round(mean_score, 2),
+        "median_score": round(median_score, 2),
+        "std_score": round(std_score, 2),
+        "trend_slope_14d": round(trend_slope_14d, 4),
+    }
+
+
+def build_rapid_metrics(user_id: int, db: Session, start_date: date) -> dict:
+    evaluations = (
+        db.query(RapidEvaluation)
+        .filter(
+            RapidEvaluation.user_id == user_id,
+            RapidEvaluation.entry_date.isnot(None),
+            RapidEvaluation.entry_date >= start_date,
+            RapidEvaluation.submitted_at.isnot(None),
+        )
+        .order_by(RapidEvaluation.entry_date.asc(), RapidEvaluation.submitted_at.desc())
+        .all()
+    )
+    count_total = len(evaluations)
+    count_valid = sum(1 for item in evaluations if item.is_valid)
+    count_invalid = count_total - count_valid
+
+    invalid_reason_counts: dict[str, int] = {}
+    for item in evaluations:
+        if not item.is_valid:
+            flags = json.loads(item.quality_flags_json or "[]")
+            for flag in flags:
+                invalid_reason_counts[flag] = invalid_reason_counts.get(flag, 0) + 1
+
+    valid_times = [
+        item.time_taken_seconds
+        for item in evaluations
+        if item.is_valid and item.time_taken_seconds is not None
+    ]
+    mean_time_seconds_valid = statistics.mean(valid_times) if valid_times else 0.0
+
+    confidence_counts = {"low": 0, "medium": 0, "high": 0}
+    level_counts = {"green": 0, "yellow": 0, "orange": 0, "red": 0}
+    for item in evaluations:
+        if item.is_valid and item.confidence_score is not None:
+            if item.confidence_score >= 0.8:
+                confidence_counts["high"] += 1
+            elif item.confidence_score >= 0.55:
+                confidence_counts["medium"] += 1
+            else:
+                confidence_counts["low"] += 1
+
+        if item.is_valid:
+            level = (item.level or "").lower()
+            if level in level_counts:
+                level_counts[level] += 1
+
+    return {
+        "count_total": count_total,
+        "count_valid": count_valid,
+        "count_invalid": count_invalid,
+        "invalid_reason_counts": invalid_reason_counts,
+        "mean_time_seconds_valid": round(mean_time_seconds_valid, 2),
+        "confidence_counts": confidence_counts,
+        "level_counts": level_counts,
+    }
+
+
+def build_safety_metrics(user_id: int, db: Session, start_date: date) -> dict:
+    evaluations = (
+        db.query(RapidEvaluation)
+        .filter(
+            RapidEvaluation.user_id == user_id,
+            RapidEvaluation.entry_date.isnot(None),
+            RapidEvaluation.entry_date >= start_date,
+            RapidEvaluation.submitted_at.isnot(None),
+        )
+        .order_by(RapidEvaluation.entry_date.asc())
+        .all()
+    )
+    red_trigger_count = sum(1 for item in evaluations if (item.level or "").upper() == "RED")
+    red_low_confidence_count = sum(
+        1
+        for item in evaluations
+        if (item.level or "").upper() == "RED"
+        and item.confidence_score is not None
+        and item.confidence_score < 0.55
+    )
+    escalation_shown_count = red_trigger_count
+
+    return {
+        "red_trigger_count": red_trigger_count,
+        "red_low_confidence_count": red_low_confidence_count,
+        "escalation_shown_count": escalation_shown_count,
+    }
+
+
+def compute_trend_slope(scores_by_day: dict[date, int], lookback_days: int) -> float:
+    if not scores_by_day:
+        return 0.0
+    days_sorted = sorted(scores_by_day.keys())[-lookback_days:]
+    if len(days_sorted) < 2:
+        return 0.0
+    y_values = [scores_by_day[day] for day in days_sorted]
+    x_values = list(range(len(y_values)))
+    x_mean = statistics.mean(x_values)
+    y_mean = statistics.mean(y_values)
+    numerator = sum((x - x_mean) * (y - y_mean) for x, y in zip(x_values, y_values))
+    denominator = sum((x - x_mean) ** 2 for x in x_values)
+    if denominator == 0:
+        return 0.0
+    return numerator / denominator
