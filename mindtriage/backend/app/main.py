@@ -24,7 +24,7 @@ from sqlalchemy import Boolean, Column, Date, DateTime, Float, ForeignKey, Integ
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import Session, relationship, sessionmaker
 
-from mindtriage.backend.app.evaluation_engine import evaluate as run_evaluation
+from .evaluation_engine import evaluate as run_evaluation
 
 DATABASE_URL = "sqlite:///./mindtriage.db"
 SECRET_KEY = "CHANGE_ME"
