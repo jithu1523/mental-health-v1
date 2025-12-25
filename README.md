@@ -117,9 +117,15 @@ http://localhost:8501/?dev=1&dev_key=local_only
 Windows PowerShell:
 ```powershell
 .\scripts\run_tests.ps1
+# or
+cd mindtriage/backend
+pytest -q
 ```
 
 Mac/Linux:
 ```bash
 ./scripts/run_tests.sh
+# or
+cd mindtriage/backend
+pytest -q
 ```
