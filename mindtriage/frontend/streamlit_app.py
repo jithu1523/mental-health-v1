@@ -92,11 +92,12 @@ def api_post(path: str, json=None, data=None):
 st.title("MindTriage")
 st.caption("Not a diagnosis. If you feel unsafe contact local emergency services.")
 
-rapid_tab_label = "Rapid Evaluation"
-export_tab_label = "Export"
-methods_tab_label = "Methods + Metrics"
-login_tab, care_tab, rapid_tab, export_tab, methods_tab = st.tabs(
-    ["Account", "Check-in & Journal", rapid_tab_label, export_tab_label, methods_tab_label]
+checkin_tab_label = "Check-in & Journal"
+history_tab_label = "Journal History"
+insights_tab_label = "Insights"
+account_tab_label = "Account"
+checkin_tab, history_tab, insights_tab, account_tab = st.tabs(
+    [checkin_tab_label, history_tab_label, insights_tab_label, account_tab_label]
 )
 
 st.subheader("Backend connection check")
@@ -118,7 +119,25 @@ else:
     )
     st.error("Start backend with: uvicorn app.main:app --reload --port 8000")
 
-with login_tab:
+st.sidebar.subheader("Developer Mode")
+if "ui_dev_mode" not in st.session_state:
+    st.session_state.ui_dev_mode = False
+if "show_quality_details" not in st.session_state:
+    st.session_state.show_quality_details = False
+if st.session_state.dev_mode:
+    st.session_state.ui_dev_mode = st.sidebar.checkbox(
+        "Enable developer controls",
+        value=st.session_state.ui_dev_mode,
+    )
+    st.session_state.show_quality_details = st.sidebar.checkbox(
+        "Show quality details",
+        value=st.session_state.show_quality_details,
+    )
+else:
+    st.session_state.ui_dev_mode = False
+    st.sidebar.info("Enable DEV_MODE in backend to unlock developer controls.")
+
+with account_tab:
     st.subheader("Sign up")
     with st.form("register_form"):
         reg_email = st.text_input("Email", key="reg_email")
@@ -158,11 +177,12 @@ with login_tab:
 
     if st.session_state.token:
         st.info("Authenticated.")
+        if st.button("Logout"):
+            st.session_state.token = None
+            st.success("Signed out.")
+            st.stop()
 
-with care_tab:
-    if not st.session_state.token:
-        st.warning("Sign in on the Account tab to continue.")
-    else:
+        st.subheader("Onboarding")
         status_resp = api_get("/onboarding/status")
         if status_resp is None:
             st.stop()
@@ -174,7 +194,6 @@ with care_tab:
         missing_ids = status.get("missing_question_ids", [])
 
         if not status.get("complete"):
-            st.subheader("Onboarding")
             questions_resp = api_get("/questions?kind=onboarding")
             if questions_resp is None:
                 st.stop()
@@ -201,114 +220,8 @@ with care_tab:
                             st.session_state.daily_questions = None
                         elif resp is not None:
                             st.error(resp.json().get("detail", "Unable to save answers."))
-            st.stop()
-
-        st.subheader("Daily check-in")
-        selected_checkin_date = date.today()
-        if st.session_state.dev_mode:
-            st.caption("Dev mode: date controls enabled.")
-            selected_checkin_date = st.date_input("Check-in date", value=date.today())
-        if st.button("Load daily questions") or st.session_state.daily_questions is None:
-            pick_resp = api_get("/daily/pick")
-            if pick_resp is not None and pick_resp.ok:
-                st.session_state.daily_questions = pick_resp.json()
-            elif pick_resp is not None:
-                st.error(pick_resp.json().get("detail", "Unable to load daily questions."))
-
-        daily_questions = st.session_state.daily_questions or []
-        if daily_questions:
-            with st.form("daily_form"):
-                daily_answers = []
-                for question in daily_questions:
-                    slug = question["slug"]
-                    if slug in {"daily_mood", "daily_anxiety"}:
-                        value = st.slider(question["text"], 1, 10, 5, key=f"daily_{question['id']}")
-                        answer_text = str(value)
-                    elif slug in {"daily_hopeless", "daily_isolation"}:
-                        choice = st.selectbox(question["text"], ["No", "Sometimes", "Yes"], key=f"daily_{question['id']}")
-                        answer_text = choice
-                    else:
-                        answer_text = st.text_input(question["text"], key=f"daily_{question['id']}")
-                    daily_answers.append({
-                        "question_id": question["id"],
-                        "answer_text": answer_text,
-                        "entry_date": selected_checkin_date.isoformat(),
-                    })
-                if st.form_submit_button("Save daily answers"):
-                    payload = {"answers": daily_answers}
-                    resp = api_post("/answers", json=payload)
-                    if resp is not None and resp.ok:
-                        st.success("Daily check-in saved.")
-                        st.session_state.daily_questions = None
-                        payload = safe_json(resp) or {}
-                        st.session_state.micro_signal = payload.get("micro_signal")
-                    elif resp is not None:
-                        st.error(resp.json().get("detail", "Unable to save daily answers."))
-
-        st.subheader("Quick check-in (10 seconds)")
-        micro_resp = api_get("/micro/today")
-        if micro_resp is not None and micro_resp.ok:
-            micro = safe_json(micro_resp) or {}
-            question = micro.get("question")
-            answered = micro.get("answered")
-            if not question:
-                st.info("No micro check-in available.")
-            elif answered:
-                st.success("Done for today ✅")
-            else:
-                with st.form("micro_form"):
-                    prompt = question.get("prompt", "Quick check-in")
-                    qtype = question.get("question_type")
-                    options = question.get("options", [])
-                    if qtype == "scale":
-                        value = st.slider(prompt, 1, 5, 3)
-                        answer_value = str(value)
-                    else:
-                        answer_value = st.selectbox(prompt, options)
-                    if st.form_submit_button("Save quick check-in"):
-                        payload = {
-                            "question_id": question.get("id"),
-                            "value": answer_value,
-                        }
-                        resp = api_post("/micro/answer", json=payload)
-                        if resp is not None and resp.ok:
-                            st.success("Quick check-in saved.")
-                        elif resp is not None:
-                            show_response_error(resp, "/micro/answer", "Unable to save quick check-in.")
-        elif micro_resp is not None:
-            show_response_error(micro_resp, "/micro/today", "Unable to load quick check-in.")
-
-        streak_resp = api_get("/micro/streak")
-        if streak_resp is not None and streak_resp.ok:
-            streak = safe_json(streak_resp) or {}
-            st.session_state.micro_streak_days = streak.get("current_streak_days", 0)
-            st.write(f"Micro streak: {st.session_state.micro_streak_days} days")
-        elif streak_resp is not None:
-            show_response_error(streak_resp, "/micro/streak", "Unable to load micro streak.")
-
-        history_resp = api_get("/micro/history?days=7")
-        if history_resp is not None and history_resp.ok:
-            history = safe_json(history_resp) or []
-            st.session_state.micro_answered_last_7 = len(history)
-            if history:
-                st.caption("Last 7 days")
-                st.table(history)
-            else:
-                st.info("No quick check-ins yet.")
-        elif history_resp is not None:
-            show_response_error(history_resp, "/micro/history", "Unable to load quick check-in history.")
-
-        if st.session_state.dev_mode:
-            debug_resp = api_get("/dev/debug/micro")
-            if debug_resp is not None and debug_resp.ok:
-                debug_data = safe_json(debug_resp) or {}
-                st.caption("Dev debug")
-                st.write(f"Total micro answers: {debug_data.get('count_micro_answers_total', 0)}")
-                last_items = debug_data.get("last_5_micro_answers", [])
-                if last_items:
-                    st.write(f"Last entry date: {last_items[0].get('entry_date')}")
-            elif debug_resp is not None:
-                show_response_error(debug_resp, "/dev/debug/micro", "Unable to load micro debug data.")
+        else:
+            st.success("Onboarding complete.")
 
         profile = status.get("profile", {})
         total_questions = profile.get("total_questions", 0)
@@ -343,27 +256,183 @@ with care_tab:
                 elif profile_resp is not None:
                     show_response_error(profile_resp, "/onboarding/questions", "Unable to load mini-profile.")
 
+with checkin_tab:
+    if not st.session_state.token:
+        st.warning("Sign in on the Account tab to continue.")
+    else:
+        status_resp = api_get("/onboarding/status")
+        if status_resp is None:
+            st.stop()
+        if not status_resp.ok:
+            st.error(status_resp.json().get("detail", "Unable to load onboarding status."))
+            st.stop()
+
+        status = status_resp.json()
+        missing_ids = status.get("missing_question_ids", [])
+
+        if not status.get("complete"):
+            st.info("Complete onboarding in the Account tab to unlock check-ins.")
+            st.stop()
+
+        st.subheader("Daily check-in")
+        selected_checkin_date = date.today()
+        override_daily_dt = None
+        if st.session_state.ui_dev_mode:
+            st.caption("Developer Mode: date/time overrides enabled.")
+            if st.checkbox("Override date/time (Daily check-in)", key="override_daily_dt"):
+                override_date = st.date_input("Daily override date", value=date.today(), key="daily_override_date")
+                override_time = st.time_input("Daily override time", value=datetime.now().time(), key="daily_override_time")
+                override_daily_dt = datetime.combine(override_date, override_time)
+                selected_checkin_date = override_date
+        if st.button("Load daily questions") or st.session_state.daily_questions is None:
+            pick_resp = api_get("/daily/pick")
+            if pick_resp is not None and pick_resp.ok:
+                st.session_state.daily_questions = pick_resp.json()
+            elif pick_resp is not None:
+                st.error(pick_resp.json().get("detail", "Unable to load daily questions."))
+
+        daily_questions = st.session_state.daily_questions or []
+        if daily_questions:
+            with st.form("daily_form"):
+                daily_answers = []
+                for question in daily_questions:
+                    slug = question["slug"]
+                    if slug in {"daily_mood", "daily_anxiety"}:
+                        value = st.slider(question["text"], 1, 10, 5, key=f"daily_{question['id']}")
+                        answer_text = str(value)
+                    elif slug in {"daily_hopeless", "daily_isolation"}:
+                        choice = st.selectbox(question["text"], ["No", "Sometimes", "Yes"], key=f"daily_{question['id']}")
+                        answer_text = choice
+                    else:
+                        answer_text = st.text_input(question["text"], key=f"daily_{question['id']}")
+                    daily_answers.append({
+                        "question_id": question["id"],
+                        "answer_text": answer_text,
+                        "entry_date": selected_checkin_date.isoformat(),
+                    })
+                if st.form_submit_button("Save daily answers"):
+                    payload = {"answers": daily_answers}
+                    if override_daily_dt:
+                        payload["override_datetime"] = override_daily_dt.isoformat()
+                    resp = api_post("/answers", json=payload)
+                    if resp is not None and resp.ok:
+                        payload = safe_json(resp) or {}
+                        if payload.get("is_low_quality"):
+                            st.warning(f"Low quality: {payload.get('reason_summary', '')}. Try adding 1-2 sentences.")
+                        else:
+                            st.success("Daily check-in saved.")
+                        if st.session_state.show_quality_details:
+                            st.caption(
+                                f"Quality score: {payload.get('input_quality_score')} | "
+                                f"Flags: {payload.get('input_quality_flags')}"
+                            )
+                        st.session_state.daily_questions = None
+                        st.session_state.micro_signal = payload.get("micro_signal")
+                    elif resp is not None:
+                        st.error(resp.json().get("detail", "Unable to save daily answers."))
+
+        st.subheader("Quick check-in (10 seconds)")
+        override_micro_dt = None
+        if st.session_state.ui_dev_mode:
+            if st.checkbox("Override date/time (Quick check-in)", key="override_micro_dt"):
+                override_date = st.date_input("Micro override date", value=date.today(), key="micro_override_date")
+                override_time = st.time_input("Micro override time", value=datetime.now().time(), key="micro_override_time")
+                override_micro_dt = datetime.combine(override_date, override_time)
+        micro_resp = api_get("/micro/today")
+        if micro_resp is not None and micro_resp.ok:
+            micro = safe_json(micro_resp) or {}
+            question = micro.get("question")
+            answered = micro.get("answered")
+            if not question:
+                st.info("No micro check-in available.")
+            elif answered:
+                st.success("Done for today ✅")
+            else:
+                with st.form("micro_form"):
+                    prompt = question.get("prompt", "Quick check-in")
+                    qtype = question.get("question_type")
+                    options = question.get("options", [])
+                    if qtype == "scale":
+                        value = st.slider(prompt, 1, 5, 3)
+                        answer_value = str(value)
+                    else:
+                        answer_value = st.selectbox(prompt, options)
+                    if st.form_submit_button("Save quick check-in"):
+                        payload = {
+                            "question_id": question.get("id"),
+                            "value": answer_value,
+                        }
+                        if override_micro_dt:
+                            payload["override_datetime"] = override_micro_dt.isoformat()
+                        resp = api_post("/micro/answer", json=payload)
+                        if resp is not None and resp.ok:
+                            st.success("Quick check-in saved.")
+                        elif resp is not None:
+                            show_response_error(resp, "/micro/answer", "Unable to save quick check-in.")
+        elif micro_resp is not None:
+            show_response_error(micro_resp, "/micro/today", "Unable to load quick check-in.")
+
+        streak_resp = api_get("/micro/streak")
+        if streak_resp is not None and streak_resp.ok:
+            streak = safe_json(streak_resp) or {}
+            st.session_state.micro_streak_days = streak.get("current_streak_days", 0)
+            st.write(f"Micro streak: {st.session_state.micro_streak_days} days")
+        elif streak_resp is not None:
+            show_response_error(streak_resp, "/micro/streak", "Unable to load micro streak.")
+
+        history_resp = api_get("/micro/history?days=7")
+        if history_resp is not None and history_resp.ok:
+            history = safe_json(history_resp) or []
+            st.session_state.micro_answered_last_7 = len(history)
+            if history:
+                st.caption("Last 7 days")
+                st.table(history)
+            else:
+                st.info("No quick check-ins yet.")
+        elif history_resp is not None:
+            show_response_error(history_resp, "/micro/history", "Unable to load quick check-in history.")
+
+        if st.session_state.ui_dev_mode:
+            debug_resp = api_get("/dev/debug/micro")
+            if debug_resp is not None and debug_resp.ok:
+                debug_data = safe_json(debug_resp) or {}
+                st.caption("Dev debug")
+                st.write(f"Total micro answers: {debug_data.get('count_micro_answers_total', 0)}")
+                last_items = debug_data.get("last_5_micro_answers", [])
+                if last_items:
+                    st.write(f"Last entry date: {last_items[0].get('entry_date')}")
+            elif debug_resp is not None:
+                show_response_error(debug_resp, "/dev/debug/micro", "Unable to load micro debug data.")
+
         st.subheader("Journal")
         selected_journal_date = date.today()
-        if st.session_state.dev_mode:
-            st.caption("Dev mode: date controls enabled.")
-            selected_journal_date = st.date_input("Journal date", value=date.today(), key="journal_date")
+        override_journal_dt = None
+        if st.session_state.ui_dev_mode:
+            st.caption("Developer Mode: date/time overrides enabled.")
+            if st.checkbox("Override date/time (Journal)", key="override_journal_dt"):
+                override_date = st.date_input("Journal override date", value=date.today(), key="journal_date")
+                override_time = st.time_input("Journal override time", value=datetime.now().time(), key="journal_time")
+                override_journal_dt = datetime.combine(override_date, override_time)
+                selected_journal_date = override_date
         journal_text = st.text_area("Write a short entry", height=140)
         if st.button("Save journal entry"):
             if not journal_text.strip():
                 st.warning("Write something before saving.")
             else:
-                resp = api_post(
-                    "/journal",
-                    json={"content": journal_text, "entry_date": selected_journal_date.isoformat()},
-                )
+                payload = {
+                    "content": journal_text,
+                    "entry_date": selected_journal_date.isoformat(),
+                }
+                if override_journal_dt:
+                    payload["override_datetime"] = override_journal_dt.isoformat()
+                resp = api_post("/journal", json=payload)
                 if resp is not None and resp.ok:
                     payload = safe_json(resp) or {}
                     if payload.get("is_low_quality"):
-                        st.warning(f"Low quality: {payload.get('reason_summary', '')}. Try adding 1–2 sentences.")
+                        st.warning(f"Low quality: {payload.get('reason_summary', '')}. Try adding 1-2 sentences.")
                     else:
                         st.success("Journal entry saved.")
-                    if st.session_state.dev_mode:
+                    if st.session_state.show_quality_details:
                         st.caption(
                             f"Quality score: {payload.get('input_quality_score')} | "
                             f"Flags: {payload.get('input_quality_flags')}"
@@ -379,18 +448,7 @@ with care_tab:
                     else:
                         show_response_error(resp, "/journal", "Unable to save journal.")
 
-        journal_resp = api_get("/journal")
-        if journal_resp is not None and journal_resp.ok:
-            entries = journal_resp.json()
-            if entries:
-                for entry in entries:
-                    st.markdown(f"**{entry['created_at']}**")
-                    st.write(entry["content"])
-                    st.divider()
-            else:
-                st.info("No journal entries yet.")
-
-        if st.session_state.dev_mode:
+        if st.session_state.ui_dev_mode:
             st.subheader("Developer Tools")
             if st.button("Seed demo data (14 days)"):
                 resp = api_post("/dev/seed_demo")
@@ -420,7 +478,15 @@ with care_tab:
                 elif resp is not None:
                     show_response_error(resp, "/dev/clear_demo", "Unable to clear demo data.")
 
-        st.subheader("Triage")
+        st.caption("Not a diagnosis. If you feel unsafe contact local emergency services.")
+
+with insights_tab:
+    st.subheader("Rapid Evaluation")
+    st.caption("Not a diagnosis. If you feel unsafe contact local emergency services.")
+    if not st.session_state.token:
+        st.warning("Sign in on the Account tab to continue.")
+    else:
+        st.subheader("Triage Summary")
         risk_level = None
         reasons = []
         risk_resp = api_get("/risk/latest")
@@ -543,18 +609,15 @@ with care_tab:
         elif insights_resp is not None:
             show_response_error(insights_resp, "/insights/today", "Unable to load insights.")
 
-st.caption("Not a diagnosis. If you feel unsafe contact local emergency services.")
-
-with rapid_tab:
-    st.subheader("Rapid Evaluation")
-    st.caption("Not a diagnosis. If you feel unsafe contact local emergency services.")
-    if not st.session_state.token:
-        st.warning("Sign in on the Account tab to continue.")
-    else:
         rapid_date = date.today()
-        if st.session_state.dev_mode:
-            st.caption("Dev mode: date controls enabled.")
-            rapid_date = st.date_input("Evaluation date", value=date.today(), key="rapid_date")
+        override_rapid_dt = None
+        if st.session_state.ui_dev_mode:
+            st.caption("Developer Mode: date/time overrides enabled.")
+            if st.checkbox("Override date/time (Rapid)", key="override_rapid_dt"):
+                override_date = st.date_input("Rapid date", value=date.today(), key="rapid_override_date")
+                override_time = st.time_input("Rapid time", value=datetime.now().time(), key="rapid_override_time")
+                override_rapid_dt = datetime.combine(override_date, override_time)
+                rapid_date = override_date
         questions_resp = api_get("/rapid/questions")
         if questions_resp is None:
             st.stop()
@@ -605,6 +668,8 @@ with rapid_tab:
                     "session_id": st.session_state.rapid_session_id,
                     "answers": rapid_answers,
                 }
+                if override_rapid_dt:
+                    payload["override_datetime"] = override_rapid_dt.isoformat()
                 resp = api_post("/rapid/submit", json=payload)
                 if resp is not None and resp.ok:
                     st.session_state.rapid_result = safe_json(resp) or {}
@@ -640,8 +705,8 @@ with rapid_tab:
                 if confidence_label == "Low":
                     st.info("Confidence is low because your answers were too quick/inconsistent. You can retake slowly.")
             if result.get("is_low_quality"):
-                st.warning(f"Low quality: {result.get('reason_summary', '')}. Try adding 1–2 sentences.")
-            if st.session_state.dev_mode:
+                st.warning(f"Low quality: {result.get('reason_summary', '')}. Try adding 1-2 sentences.")
+            if st.session_state.show_quality_details:
                 st.caption(
                     f"Quality score: {result.get('input_quality_score')} | "
                     f"Flags: {result.get('input_quality_flags')}"
@@ -716,13 +781,40 @@ with rapid_tab:
         elif history_resp is not None:
             show_response_error(history_resp, "/rapid/history", "Unable to load rapid history.")
 
-with export_tab:
-    st.subheader("Export")
+with history_tab:
+    st.subheader("Journal History")
     st.caption("Not a diagnosis. If you feel unsafe contact local emergency services.")
     if not st.session_state.token:
         st.warning("Sign in on the Account tab to continue.")
     else:
-        days = st.selectbox("Days", [7, 30, 90], index=1)
+        days = st.selectbox("Show last", [7, 30, 90], index=1, key="journal_days")
+        search = st.text_input("Search journal text", value="", key="journal_search")
+
+        journal_resp = api_get(f"/journal?days={days}")
+        if journal_resp is not None and journal_resp.ok:
+            entries = safe_json(journal_resp) or []
+            if search:
+                entries = [
+                    entry for entry in entries
+                    if search.lower() in entry.get("content", "").lower()
+                ]
+            if entries:
+                for entry in entries:
+                    preview = entry.get("content", "")[:120]
+                    with st.expander(f"{entry.get('created_at')} — {preview}"):
+                        st.write(entry.get("content"))
+                        if st.session_state.ui_dev_mode:
+                            flags = entry.get("input_quality_flags") or []
+                            if flags:
+                                st.caption(f"Quality flags: {flags}")
+                            if entry.get("is_low_quality"):
+                                st.caption("Low quality entry.")
+            else:
+                st.info("No journal entries found.")
+        elif journal_resp is not None:
+            show_response_error(journal_resp, "/journal", "Unable to load journal history.")
+
+        st.subheader("Export")
         include_text = st.checkbox("Include journal text", value=False)
         st.warning("Never share exports containing journal text publicly.")
         if st.button("Download Anonymized Export"):
@@ -751,7 +843,7 @@ with export_tab:
                 mime="application/zip",
             )
 
-with methods_tab:
+with insights_tab:
     st.subheader("Methods + Metrics")
     st.caption("Not a diagnosis. If you feel unsafe contact local emergency services.")
     if not st.session_state.token:

@@ -207,11 +207,13 @@ class AnswerCreate(BaseModel):
 
 class AnswerBatch(BaseModel):
     answers: List[AnswerCreate]
+    override_datetime: Optional[datetime] = None
 
 
 class JournalCreate(BaseModel):
     content: str
     entry_date: Optional[date] = None
+    override_datetime: Optional[datetime] = None
 
 
 class JournalResponse(BaseModel):
@@ -266,6 +268,7 @@ class MicroAnswerCreate(BaseModel):
     question_id: int
     value: str
     entry_date: Optional[date] = None
+    override_datetime: Optional[datetime] = None
 
 
 class ActionPlanItem(BaseModel):
@@ -315,6 +318,7 @@ class RapidSubmitRequest(BaseModel):
     entry_date: Optional[date] = None
     started_at: Optional[datetime] = None
     session_id: Optional[int] = None
+    override_datetime: Optional[datetime] = None
     answers: List[RapidAnswer]
 
 
@@ -752,7 +756,8 @@ def health() -> dict:
 
 def is_dev_mode() -> bool:
     value = os.getenv("MINDTRIAGE_DEV_MODE", "").strip().lower()
-    return value in {"1", "true", "yes", "on"}
+    alt = os.getenv("DEV_MODE", "").strip().lower()
+    return value in {"1", "true", "yes", "on"} or alt in {"1", "true", "yes", "on"}
 
 
 @app.post("/auth/register", response_model=TokenResponse)
@@ -995,6 +1000,7 @@ def micro_answer(
     db: Session = Depends(get_db),
 ) -> dict:
     today = date.today()
+    override_dt = payload.override_datetime if is_dev_mode() else None
     entry_date = payload.entry_date or today
     if not is_dev_mode():
         if payload.entry_date and payload.entry_date != today:
@@ -1003,6 +1009,8 @@ def micro_answer(
                 detail="entry_date must be today unless dev mode is enabled.",
             )
         entry_date = today
+    if override_dt:
+        entry_date = override_dt.date()
 
     question = (
         db.query(MicroQuestion)
@@ -1033,7 +1041,7 @@ def micro_answer(
     if existing:
         existing.question_id = question.id
         existing.value_json = json.dumps({"value": value})
-        existing.created_at = datetime.utcnow()
+        existing.created_at = override_dt or datetime.utcnow()
         saved = existing
     else:
         saved = MicroAnswer(
@@ -1041,6 +1049,7 @@ def micro_answer(
             question_id=question.id,
             entry_date=entry_date,
             value_json=json.dumps({"value": value}),
+            created_at=override_dt or datetime.utcnow(),
         )
         db.add(saved)
     db.commit()
@@ -1198,14 +1207,17 @@ def submit_answers(
         raise HTTPException(status_code=400, detail="No answers provided")
 
     question_ids = [item.question_id for item in payload.answers]
-    existing_questions = {
-        q.id for q in db.query(Question).filter(Question.id.in_(question_ids)).all()
-    }
+    questions = db.query(Question).filter(Question.id.in_(question_ids)).all()
+    existing_questions = {q.id for q in questions}
+    is_daily = any(q.kind == "daily" for q in questions)
     missing = [qid for qid in question_ids if qid not in existing_questions]
     if missing:
         raise HTTPException(status_code=400, detail=f"Unknown question IDs: {missing}")
 
     today = date.today()
+    override_dt = payload.override_datetime if is_dev_mode() else None
+    if override_dt:
+        today = override_dt.date()
     if not is_dev_mode():
         for item in payload.answers:
             if item.entry_date and item.entry_date != today:
@@ -1219,17 +1231,50 @@ def submit_answers(
         entry_date = item.entry_date or today
         if not is_dev_mode():
             entry_date = today
+        created_at = override_dt if override_dt else datetime.utcnow()
         created.append(Answer(
             user_id=user.id,
             question_id=item.question_id,
             answer_text=item.answer_text.strip(),
             entry_date=entry_date,
+            created_at=created_at,
         ))
     db.add_all(created)
     db.commit()
     update_user_baseline(user.id, db)
-    micro_signal = build_micro_signal(user.id, db)
-    return {"saved": len(created), "micro_signal": micro_signal}
+    response = {"saved": len(created), "micro_signal": build_micro_signal(user.id, db)}
+    if is_daily:
+        recent_texts = [
+            item.answer_text
+            for item in db.query(Answer)
+            .join(Question, Answer.question_id == Question.id)
+            .filter(
+                Answer.user_id == user.id,
+                Question.kind == "daily",
+            )
+            .order_by(Answer.created_at.desc())
+            .limit(10)
+            .all()
+        ]
+        short_window_count = (
+            db.query(Answer)
+            .join(Question, Answer.question_id == Question.id)
+            .filter(
+                Answer.user_id == user.id,
+                Question.kind == "daily",
+                Answer.created_at >= datetime.utcnow() - timedelta(minutes=10),
+            )
+            .count()
+        )
+        text_blob = " ".join(item.answer_text.strip() for item in payload.answers)
+        quality = assess_input_quality(text_blob, recent_texts, short_window_count)
+        response.update({
+            "input_quality_score": quality["quality_score"],
+            "input_quality_flags": quality["flags"],
+            "is_low_quality": quality["is_low_quality"],
+            "reason_summary": quality["reason_summary"],
+        })
+    return response
 
 
 @app.post("/journal", response_model=JournalResponse)
@@ -1241,7 +1286,11 @@ def create_journal_entry(
     content = payload.content.strip()
     if not content:
         raise HTTPException(status_code=400, detail="Journal content cannot be empty")
-    cutoff = datetime.utcnow() - timedelta(hours=1)
+    now = datetime.utcnow()
+    override_dt = payload.override_datetime if is_dev_mode() else None
+    if override_dt:
+        now = override_dt
+    cutoff = now - timedelta(hours=1)
     recent_count = (
         db.query(JournalEntry)
         .filter(JournalEntry.user_id == user.id, JournalEntry.created_at >= cutoff)
@@ -1254,7 +1303,7 @@ def create_journal_entry(
             .order_by(JournalEntry.created_at.asc())
             .first()
         )
-        retry_after = calculate_retry_after(oldest.created_at if oldest else None)
+        retry_after = calculate_retry_after(oldest.created_at if oldest else None, now)
         raise HTTPException(
             status_code=429,
             detail="Journal rate limit reached (10 per hour). Please try again later.",
@@ -1269,6 +1318,8 @@ def create_journal_entry(
                 detail="entry_date must be today unless dev mode is enabled.",
             )
         entry_date = today
+    if override_dt:
+        entry_date = override_dt.date()
     recent_texts = [
         item.content
         for item in db.query(JournalEntry)
@@ -1290,6 +1341,7 @@ def create_journal_entry(
         user_id=user.id,
         content=content,
         entry_date=entry_date,
+        created_at=now,
         input_quality_score=quality["quality_score"],
         input_quality_flags_json=json.dumps(quality["flags"]),
         is_low_quality=quality["is_low_quality"],
@@ -1311,17 +1363,34 @@ def create_journal_entry(
 
 @app.get("/journal", response_model=List[JournalResponse])
 def list_journal_entries(
+    days: int = Query(30, ge=1, le=365),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ) -> List[JournalResponse]:
+    start_date = date.today() - timedelta(days=days - 1)
     entries = (
         db.query(JournalEntry)
-        .filter(JournalEntry.user_id == user.id)
+        .filter(
+            JournalEntry.user_id == user.id,
+            JournalEntry.entry_date.isnot(None),
+            JournalEntry.entry_date >= start_date,
+        )
         .order_by(JournalEntry.created_at.desc())
-        .limit(20)
+        .limit(200)
         .all()
     )
-    return [JournalResponse(id=e.id, content=e.content, created_at=e.created_at) for e in entries]
+    return [
+        JournalResponse(
+            id=e.id,
+            content=e.content,
+            created_at=e.created_at,
+            input_quality_score=e.input_quality_score,
+            input_quality_flags=json.loads(e.input_quality_flags_json or "[]"),
+            is_low_quality=e.is_low_quality,
+            reason_summary=summarize_quality_flags(json.loads(e.input_quality_flags_json or "[]")),
+        )
+        for e in entries
+    ]
 
 
 @app.get("/risk/latest", response_model=RiskResponse)
@@ -1522,6 +1591,9 @@ def rapid_submit(
     db: Session = Depends(get_db),
 ) -> RapidSubmitResponse:
     now = datetime.utcnow()
+    override_dt = payload.override_datetime if is_dev_mode() else None
+    if override_dt:
+        now = override_dt
     if is_dev_mode():
         cooldown_seconds = 5
         daily_limit = 50
@@ -1595,6 +1667,8 @@ def rapid_submit(
                 detail="entry_date must be today unless dev mode is enabled.",
             )
         entry_date = today
+    if override_dt:
+        entry_date = override_dt.date()
     started_at = active_session.started_at if active_session else (payload.started_at or now)
     submitted_at = now
     time_taken_seconds = (submitted_at - started_at).total_seconds() if started_at else 0.0
@@ -1671,12 +1745,15 @@ def rapid_submit(
         active_session.time_taken_seconds = time_taken_seconds
         active_session.is_valid = is_valid
         active_session.quality_flags_json = json.dumps(quality_flags)
+        if override_dt:
+            active_session.created_at = override_dt
     else:
         evaluation = RapidEvaluation(
             user_id=user.id,
             entry_date=entry_date,
             started_at=started_at,
             submitted_at=submitted_at,
+            created_at=now,
             answers_json=answers_payload,
             score=score,
             level=level,
@@ -2853,10 +2930,11 @@ def summarize_quality_flags(flags: List[str]) -> str:
     return "; ".join(summary)
 
 
-def calculate_retry_after(oldest_created_at: Optional[datetime]) -> int:
+def calculate_retry_after(oldest_created_at: Optional[datetime], now: Optional[datetime] = None) -> int:
     if not oldest_created_at:
         return 3600
-    remaining = 3600 - (datetime.utcnow() - oldest_created_at).total_seconds()
+    now = now or datetime.utcnow()
+    remaining = 3600 - (now - oldest_created_at).total_seconds()
     return max(60, int(remaining))
 
 

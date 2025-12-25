@@ -66,6 +66,10 @@ macOS / Linux:
 export MINDTRIAGE_DEV_MODE=1
 ```
 
+You can also use `DEV_MODE=1` as an alias.
+
+Frontend developer controls (date/time overrides, quality details) appear only when dev mode is enabled in the backend.
+
 ## Run the frontend
 
 In a second terminal (with the venv active):
