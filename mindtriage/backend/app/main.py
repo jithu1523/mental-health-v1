@@ -46,6 +46,7 @@ class User(Base):
 
     journal_entries = relationship("JournalEntry", back_populates="user")
     answers = relationship("Answer", back_populates="user")
+    onboarding_answers = relationship("OnboardingAnswer", back_populates="user")
 
 
 class JournalEntry(Base):
@@ -80,6 +81,30 @@ class RapidEvaluation(Base):
     is_valid = Column(Boolean, default=True, nullable=False)
     quality_flags_json = Column(String, nullable=False, default="[]")
     is_demo = Column(Boolean, default=False, nullable=False)
+
+
+class OnboardingQuestion(Base):
+    __tablename__ = "onboarding_questions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    question = Column(String, nullable=False)
+    options_json = Column(String, nullable=False, default="[]")
+    category = Column(String, nullable=False)
+    weight = Column(Integer, nullable=False, default=1)
+    is_active = Column(Boolean, default=True, nullable=False)
+
+
+class OnboardingAnswer(Base):
+    __tablename__ = "onboarding_answers"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    question_id = Column(Integer, ForeignKey("onboarding_questions.id"), nullable=False)
+    selected_option = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    user = relationship("User", back_populates="onboarding_answers")
+    question = relationship("OnboardingQuestion")
 
 
 class Question(Base):
@@ -156,6 +181,23 @@ class RiskHistoryEntry(BaseModel):
     date: str
     score: int
     level: str
+
+
+class OnboardingQuestionResponse(BaseModel):
+    id: int
+    question: str
+    options: List[str]
+    category: str
+    weight: int
+
+
+class OnboardingAnswerCreate(BaseModel):
+    question_id: int
+    selected_option: Optional[str] = None
+
+
+class OnboardingAnswerBatch(BaseModel):
+    answers: List[OnboardingAnswerCreate]
 
 
 class RapidQuestion(BaseModel):
@@ -242,6 +284,69 @@ DAILY_QUESTIONS = [
     {"kind": "daily", "slug": "daily_focus", "text": "How is your focus today?"},
     {"kind": "daily", "slug": "daily_isolation", "text": "Do you feel isolated today?"},
     {"kind": "daily", "slug": "daily_hopeless", "text": "Have you felt hopeless today?"},
+]
+
+ONBOARDING_PROFILE_QUESTIONS = [
+    {
+        "question": "Which area would you most like support with right now?",
+        "options": ["Mood", "Anxiety", "Stress", "Sleep", "Motivation", "Focus"],
+        "category": "goals",
+        "weight": 2,
+    },
+    {
+        "question": "How often have you felt overwhelmed lately?",
+        "options": ["Rarely", "Sometimes", "Often", "Almost always"],
+        "category": "stress",
+        "weight": 2,
+    },
+    {
+        "question": "How supported do you feel by people in your life?",
+        "options": ["Very supported", "Somewhat supported", "Not very supported", "Not at all supported"],
+        "category": "support",
+        "weight": 2,
+    },
+    {
+        "question": "How would you describe your sleep quality?",
+        "options": ["Good", "Okay", "Poor", "Very poor"],
+        "category": "sleep",
+        "weight": 1,
+    },
+    {
+        "question": "How is your energy most days?",
+        "options": ["High", "Moderate", "Low", "Very low"],
+        "category": "energy",
+        "weight": 1,
+    },
+    {
+        "question": "How connected do you feel to your routines?",
+        "options": ["Very connected", "Somewhat connected", "Barely connected", "Not connected"],
+        "category": "routine",
+        "weight": 1,
+    },
+    {
+        "question": "How often do you feel anxious in a typical week?",
+        "options": ["Rarely", "Some days", "Most days", "Nearly every day"],
+        "category": "anxiety",
+        "weight": 2,
+    },
+    {
+        "question": "How often do you feel down in a typical week?",
+        "options": ["Rarely", "Some days", "Most days", "Nearly every day"],
+        "category": "mood",
+        "weight": 2,
+    },
+    {
+        "question": "How much are you using coping tools right now?",
+        "options": ["A lot", "Some", "A little", "Not at all"],
+        "category": "coping",
+        "weight": 1,
+    },
+    {
+        "question": "How safe do you feel day to day?",
+        "options": ["Safe", "Mostly safe", "Sometimes unsafe", "Often unsafe"],
+        "category": "safety",
+        "weight": 2,
+    },
 ]
 
 RAPID_QUESTIONS = [
@@ -333,7 +438,9 @@ def on_startup() -> None:
     Base.metadata.create_all(bind=engine)
     ensure_entry_date_columns()
     ensure_rapid_columns()
+    ensure_onboarding_tables()
     seed_questions()
+    seed_onboarding_profile_questions()
 
 
 def seed_questions() -> None:
@@ -344,6 +451,31 @@ def seed_questions() -> None:
         for item in ONBOARDING_QUESTIONS + DAILY_QUESTIONS:
             if item["slug"] not in existing:
                 to_add.append(Question(**item))
+        if to_add:
+            session.add_all(to_add)
+            session.commit()
+    finally:
+        session.close()
+
+
+def ensure_onboarding_tables() -> None:
+    Base.metadata.create_all(bind=engine)
+
+
+def seed_onboarding_profile_questions() -> None:
+    session = SessionLocal()
+    try:
+        existing = {q.question for q in session.query(OnboardingQuestion).all()}
+        to_add = []
+        for item in ONBOARDING_PROFILE_QUESTIONS:
+            if item["question"] not in existing:
+                to_add.append(OnboardingQuestion(
+                    question=item["question"],
+                    options_json=json.dumps(item["options"]),
+                    category=item["category"],
+                    weight=item["weight"],
+                    is_active=True,
+                ))
         if to_add:
             session.add_all(to_add)
             session.commit()
@@ -505,7 +637,37 @@ def onboarding_status(
         .all()
     }
     missing_ids = [qid for qid in onboarding_ids if qid not in answered_ids]
-    return {"complete": len(missing_ids) == 0, "missing_question_ids": missing_ids}
+
+    profile_questions = db.query(OnboardingQuestion).filter(OnboardingQuestion.is_active.is_(True)).all()
+    profile_total = len(profile_questions)
+    if profile_questions:
+        profile_answered = (
+            db.query(OnboardingAnswer)
+            .filter(
+                OnboardingAnswer.user_id == user.id,
+                OnboardingAnswer.question_id.in_([q.id for q in profile_questions]),
+            )
+            .count()
+        )
+    else:
+        profile_answered = 0
+    last_answered = (
+        db.query(func.max(OnboardingAnswer.created_at))
+        .filter(OnboardingAnswer.user_id == user.id)
+        .scalar()
+    )
+    completed_percent = round((profile_answered / profile_total) * 100, 1) if profile_total else 0.0
+
+    return {
+        "complete": len(missing_ids) == 0,
+        "missing_question_ids": missing_ids,
+        "profile": {
+            "total_questions": profile_total,
+            "answered": profile_answered,
+            "completed_percent": completed_percent,
+            "last_answered_at": last_answered.isoformat() if last_answered else None,
+        },
+    }
 
 
 @app.get("/daily/pick", response_model=List[QuestionResponse])
@@ -528,6 +690,88 @@ def daily_pick(
     chosen.extend(random.sample(remaining, k=3 - len(chosen)))
 
     return [QuestionResponse(id=q.id, kind=q.kind, slug=q.slug, text=q.text) for q in chosen]
+
+
+@app.get("/onboarding/questions", response_model=List[OnboardingQuestionResponse])
+def onboarding_questions(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> List[OnboardingQuestionResponse]:
+    questions = (
+        db.query(OnboardingQuestion)
+        .filter(OnboardingQuestion.is_active.is_(True))
+        .order_by(OnboardingQuestion.id)
+        .all()
+    )
+    answered_ids = {
+        item.question_id
+        for item in db.query(OnboardingAnswer)
+        .filter(OnboardingAnswer.user_id == user.id)
+        .all()
+    }
+    remaining = [q for q in questions if q.id not in answered_ids]
+    selected = remaining[:4]
+    return [
+        OnboardingQuestionResponse(
+            id=q.id,
+            question=q.question,
+            options=json.loads(q.options_json),
+            category=q.category,
+            weight=q.weight,
+        )
+        for q in selected
+    ]
+
+
+@app.post("/onboarding/answer")
+def onboarding_answer(
+    payload: OnboardingAnswerBatch,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    if not payload.answers:
+        raise HTTPException(status_code=400, detail="No answers provided")
+
+    question_ids = [item.question_id for item in payload.answers]
+    questions = (
+        db.query(OnboardingQuestion)
+        .filter(OnboardingQuestion.id.in_(question_ids), OnboardingQuestion.is_active.is_(True))
+        .all()
+    )
+    question_map = {q.id: q for q in questions}
+    missing = [qid for qid in question_ids if qid not in question_map]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"Unknown question IDs: {missing}")
+
+    saved = 0
+    for item in payload.answers:
+        question = question_map[item.question_id]
+        selected = (item.selected_option or "skipped").strip()
+        options = json.loads(question.options_json)
+        if selected != "skipped" and selected not in options:
+            raise HTTPException(status_code=400, detail=f"Invalid option for question {question.id}")
+
+        existing = (
+            db.query(OnboardingAnswer)
+            .filter(
+                OnboardingAnswer.user_id == user.id,
+                OnboardingAnswer.question_id == question.id,
+            )
+            .first()
+        )
+        if existing:
+            existing.selected_option = selected
+            existing.created_at = datetime.utcnow()
+        else:
+            db.add(OnboardingAnswer(
+                user_id=user.id,
+                question_id=question.id,
+                selected_option=selected,
+            ))
+        saved += 1
+
+    db.commit()
+    return {"saved": saved}
 
 
 def is_recent_mood_or_anxiety_low(user_id: int, db: Session) -> bool:

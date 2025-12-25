@@ -231,6 +231,39 @@ with care_tab:
                     elif resp is not None:
                         st.error(resp.json().get("detail", "Unable to save daily answers."))
 
+        profile = status.get("profile", {})
+        total_questions = profile.get("total_questions", 0)
+        answered = profile.get("answered", 0)
+        if total_questions:
+            st.subheader("Mini-Profile (optional)")
+            st.caption("Answer a few quick questions to personalize your baseline.")
+            st.write(f"Progress: {answered}/{total_questions} completed")
+            if answered < total_questions:
+                profile_resp = api_get("/onboarding/questions")
+                if profile_resp is not None and profile_resp.ok:
+                    profile_questions = safe_json(profile_resp) or []
+                    if profile_questions:
+                        with st.form("profile_form"):
+                            profile_answers = []
+                            for question in profile_questions:
+                                options = ["Skip for now"] + question.get("options", [])
+                                choice = st.selectbox(question["question"], options, key=f"profile_{question['id']}")
+                                selected = None if choice == "Skip for now" else choice
+                                profile_answers.append({
+                                    "question_id": question["id"],
+                                    "selected_option": selected,
+                                })
+                            if st.form_submit_button("Save mini-profile answers"):
+                                resp = api_post("/onboarding/answer", json={"answers": profile_answers})
+                                if resp is not None and resp.ok:
+                                    st.success("Mini-profile saved.")
+                                elif resp is not None:
+                                    show_response_error(resp, "/onboarding/answer", "Unable to save mini-profile.")
+                    else:
+                        st.info("You're all set for now.")
+                elif profile_resp is not None:
+                    show_response_error(profile_resp, "/onboarding/questions", "Unable to load mini-profile.")
+
         st.subheader("Journal")
         selected_journal_date = date.today()
         if st.session_state.dev_mode:
