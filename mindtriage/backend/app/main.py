@@ -10,6 +10,7 @@ import uuid
 import zipfile
 from datetime import date, datetime, timedelta
 from hashlib import sha256
+from pathlib import Path
 import statistics
 from typing import List, Optional
 
@@ -19,6 +20,7 @@ from fastapi.responses import Response
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import JWTError, jwt
 from passlib.context import CryptContext
+from dotenv import load_dotenv
 from pydantic import BaseModel
 from sqlalchemy import Boolean, Column, Date, DateTime, Float, ForeignKey, Integer, String, UniqueConstraint, create_engine, func, text, or_
 from sqlalchemy.ext.declarative import declarative_base
@@ -32,7 +34,15 @@ from .baseline_engine import (
     collect_signals_for_window,
 )
 
-DATABASE_URL = "sqlite:///./mindtriage.db"
+APP_VERSION = "1.4.0"
+REPO_ROOT = Path(__file__).resolve().parents[3]
+load_dotenv(REPO_ROOT / ".env")
+
+db_env = os.getenv("DB_PATH", "").strip()
+DB_PATH = db_env if db_env else str(REPO_ROOT / "mindtriage.db")
+if not Path(DB_PATH).is_absolute():
+    DB_PATH = str(REPO_ROOT / DB_PATH)
+DATABASE_URL = f"sqlite:///{DB_PATH}"
 SECRET_KEY = "CHANGE_ME"
 EXPORT_SALT = "LOCAL_EXPORT_SALT_CHANGE_ME"
 ROTATION_SALT = "LOCAL_ROTATION_SALT_CHANGE_ME"
@@ -961,12 +971,23 @@ def get_current_user(
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok", "dev_mode": is_dev_mode()}
+    db_status = "ok"
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+    except Exception:
+        db_status = "error"
+    return {
+        "status": "ok",
+        "version": APP_VERSION,
+        "db": db_status,
+        "dev_mode": is_dev_mode(),
+    }
 
 
 @app.get("/meta")
 def meta() -> dict:
-    return {"dev_mode": is_dev_mode()}
+    return {"version": APP_VERSION, "dev_mode": is_dev_mode()}
 
 
 @app.get("/safety/resources")

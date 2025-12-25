@@ -7,9 +7,12 @@ import pandas as pd
 import requests
 import streamlit as st
 
+FRONTEND_VERSION = "1.4.0"
+
 st.set_page_config(page_title="MindTriage", page_icon="??", layout="centered")
 
-API_BASE = st.text_input("API base URL", value="http://127.0.0.1:8000")
+default_backend = os.getenv("BACKEND_URL", "http://127.0.0.1:8000")
+API_BASE = st.text_input("API base URL", value=default_backend)
 
 if "token" not in st.session_state:
     st.session_state.token = None
@@ -39,6 +42,8 @@ if "baseline_insights" not in st.session_state:
     st.session_state.baseline_insights = None
 if "crisis_state" not in st.session_state:
     st.session_state.crisis_state = {}
+if "backend_version" not in st.session_state:
+    st.session_state.backend_version = "unknown"
 if "eval_daily" not in st.session_state:
     st.session_state.eval_daily = None
 if "eval_daily_followups" not in st.session_state:
@@ -152,6 +157,19 @@ def api_post(path: str, json=None, data=None):
 st.title("MindTriage")
 st.caption("Not a diagnosis. If you feel unsafe contact local emergency services.")
 
+health_resp = api_get("/health")
+if health_resp is not None and health_resp.ok:
+    payload = safe_json(health_resp) or {}
+    st.session_state.backend_version = payload.get("version", "unknown")
+    st.success(f"Backend connected (v{st.session_state.backend_version}).")
+else:
+    st.error(
+        "Backend not reachable. Start backend with: "
+        "uvicorn app.main:app --reload --port 8000"
+    )
+    if health_resp is not None:
+        show_response_error(health_resp, "/health", "Backend error")
+
 home_tab_label = "Home"
 micro_tab_label = "Quick Check-in"
 daily_tab_label = "Daily Check-in"
@@ -205,8 +223,11 @@ def get_query_param(key: str) -> str:
 
 dev_ui_enabled = False
 local_dev_env = os.getenv("DEV_MODE", "").strip().lower() in {"1", "true", "yes", "on"}
+dev_secret = os.getenv("DEV_SECRET", "").strip()
 dev_requested = get_query_param("dev") == "1"
-if st.session_state.backend_dev_mode and local_dev_env and dev_requested:
+dev_key = get_query_param("dev_key")
+secret_ok = True if not dev_secret else dev_key == dev_secret
+if st.session_state.backend_dev_mode and local_dev_env and dev_requested and secret_ok:
     dev_ui_enabled = True
 
 if "ui_dev_mode" not in st.session_state:
@@ -231,6 +252,8 @@ else:
     st.session_state.ui_dev_mode = False
     st.session_state.show_quality_details = False
     st.session_state.include_low_quality = False
+
+st.sidebar.caption(f"Frontend v{FRONTEND_VERSION} | Backend v{st.session_state.backend_version}")
 
 with home_tab:
     st.subheader("Today")
