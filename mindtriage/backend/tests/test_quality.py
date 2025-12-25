@@ -66,6 +66,8 @@ class QualityTests(unittest.TestCase):
             today = date.today()
             high_date = today
             low_date = today - timedelta(days=1)
+            now = datetime.utcnow()
+            later = now + timedelta(seconds=1)
 
             db.add(main.MicroAnswer(
                 user_id=user_id,
@@ -73,6 +75,8 @@ class QualityTests(unittest.TestCase):
                 entry_date=high_date,
                 value_json='{"value":"3"}',
                 is_low_quality=False,
+                created_at=now,
+                answered_at=now,
             ))
             db.add(main.MicroAnswer(
                 user_id=user_id,
@@ -80,6 +84,8 @@ class QualityTests(unittest.TestCase):
                 entry_date=low_date,
                 value_json='{"value":"1"}',
                 is_low_quality=True,
+                created_at=later,
+                answered_at=later,
             ))
             db.commit()
 

@@ -20,7 +20,7 @@ class EvaluationEngineTests(unittest.TestCase):
         self.assertTrue(result.quality.flags)
 
     def test_followups_when_low_confidence(self):
-        result = evaluation_engine.evaluate(journal_text="x", duration_seconds=5)
+        result = evaluation_engine.evaluate(journal_text="!!!@@@", duration_seconds=5)
         self.assertTrue(result.recommended_followups)
 
 
