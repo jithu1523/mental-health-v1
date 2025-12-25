@@ -374,21 +374,32 @@ with checkin_tab:
                         st.error(resp.json().get("detail", "Unable to save daily answers."))
 
         st.subheader("Quick check-in (10 seconds)")
-        override_micro_dt = None
+        override_micro_date = None
         if st.session_state.ui_dev_mode:
-            if st.checkbox("Override date/time (Quick check-in)", key="override_micro_dt"):
-                override_date = st.date_input("Micro override date", value=date.today(), key="micro_override_date")
-                override_time = st.time_input("Micro override time", value=datetime.now().time(), key="micro_override_time")
-                override_micro_dt = override_date
+            if st.checkbox("Override date (Quick check-in)", key="override_micro_dt"):
+                override_micro_date = st.date_input(
+                    "Micro override date",
+                    value=date.today(),
+                    key="micro_override_date",
+                )
+        micro_status_date = override_micro_date or date.today()
+        status_resp = api_get(f"/micro/status?entry_date={micro_status_date.isoformat()}")
+        done_for_date = False
+        if status_resp is not None and status_resp.ok:
+            status_payload = safe_json(status_resp) or {}
+            done_for_date = bool(status_payload.get("done"))
+        elif status_resp is not None:
+            show_response_error(status_resp, "/micro/status", "Unable to load micro status.")
+
         micro_resp = api_get("/micro/today")
         if micro_resp is not None and micro_resp.ok:
             micro = safe_json(micro_resp) or {}
             question = micro.get("question")
-            answered = micro.get("answered")
             if not question:
                 st.info("No micro check-in available.")
-            elif answered:
-                st.success("Done for today ✅")
+            elif done_for_date:
+                label = "Done for selected date ✅" if override_micro_date else "Done for today ✅"
+                st.success(label)
             else:
                 with st.form("micro_form"):
                     prompt = question.get("prompt", "Quick check-in")
@@ -399,18 +410,18 @@ with checkin_tab:
                         answer_value = str(value)
                     else:
                         answer_value = st.selectbox(prompt, options)
-                    if st.form_submit_button("Save quick check-in"):
+                    if st.form_submit_button("Save micro answers"):
                         payload = {
                             "question_id": question.get("id"),
                             "value": answer_value,
                         }
-                        if override_micro_dt:
-                            payload["override_entry_date"] = override_micro_dt.isoformat()
-                        resp = api_post("/micro/answer", json=payload)
+                        if override_micro_date:
+                            payload["override_entry_date"] = override_micro_date.isoformat()
+                        resp = api_post("/micro/answers", json=payload)
                         if resp is not None and resp.ok:
                             st.success("Quick check-in saved.")
                         elif resp is not None:
-                            show_response_error(resp, "/micro/answer", "Unable to save quick check-in.")
+                            show_response_error(resp, "/micro/answers", "Unable to save quick check-in.")
         elif micro_resp is not None:
             show_response_error(micro_resp, "/micro/today", "Unable to load quick check-in.")
 

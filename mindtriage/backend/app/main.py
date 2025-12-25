@@ -1062,7 +1062,7 @@ def micro_today(
     }
 
 
-@app.post("/micro/answer")
+@app.post("/micro/answers")
 def micro_answer(
     payload: MicroAnswerCreate,
     user: User = Depends(get_current_user),
@@ -1136,6 +1136,15 @@ def micro_answer(
     }
 
 
+@app.post("/micro/answer", include_in_schema=False)
+def micro_answer_legacy(
+    payload: MicroAnswerCreate,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    return micro_answer(payload, user, db)
+
+
 @app.get("/micro/history")
 def micro_history(
     days: int = Query(30, ge=1, le=365),
@@ -1164,6 +1173,31 @@ def micro_history(
             "created_at": answer.answered_at.isoformat(),
         })
     return history
+
+
+@app.get("/micro/status")
+def micro_status(
+    entry_date: date = Query(...),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    rows = (
+        db.query(MicroAnswer)
+        .filter(
+            MicroAnswer.user_id == user.id,
+            MicroAnswer.entry_date == entry_date,
+        )
+        .order_by(MicroAnswer.answered_at.desc())
+        .all()
+    )
+    done = len(rows) > 0
+    last_created = rows[0].answered_at.isoformat() if rows else None
+    return {
+        "entry_date": entry_date.isoformat(),
+        "done": done,
+        "count": len(rows),
+        "last_created_at": last_created,
+    }
 
 
 @app.get("/dev/debug/micro")
