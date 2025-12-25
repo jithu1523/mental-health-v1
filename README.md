@@ -111,3 +111,15 @@ http://localhost:8501/?dev=1&dev_key=local_only
 
 - Backend health: http://127.0.0.1:8000/health
 - If the frontend cannot connect, ensure port 8000 is free and the backend is running.
+
+## Tests
+
+Windows PowerShell:
+```powershell
+.\scripts\run_tests.ps1
+```
+
+Mac/Linux:
+```bash
+./scripts/run_tests.sh
+```
