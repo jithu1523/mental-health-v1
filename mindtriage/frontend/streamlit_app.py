@@ -37,6 +37,8 @@ if "micro_answered_last_7" not in st.session_state:
     st.session_state.micro_answered_last_7 = 0
 if "baseline_insights" not in st.session_state:
     st.session_state.baseline_insights = None
+if "crisis_state" not in st.session_state:
+    st.session_state.crisis_state = {}
 if "eval_daily" not in st.session_state:
     st.session_state.eval_daily = None
 if "eval_daily_followups" not in st.session_state:
@@ -87,6 +89,44 @@ def show_response_error(resp: requests.Response, path: str, fallback_message: st
     st.error(f"{fallback_message} ({resp.status_code}) | {url} | {snippet}")
 
 
+def render_crisis_banner(crisis_payload: dict, section_key: str) -> None:
+    if not crisis_payload or not crisis_payload.get("is_crisis"):
+        return
+    state = st.session_state.crisis_state.setdefault(section_key, {})
+    if state.get("hidden"):
+        return
+    st.error("You may be going through something serious.")
+    cols = st.columns(3)
+    if cols[0].button("I'm safe right now", key=f"crisis_safe_{section_key}"):
+        state["acknowledged"] = True
+    if cols[1].button("Get help now", key=f"crisis_help_{section_key}"):
+        state["show_resources"] = True
+    if cols[2].button("Hide", key=f"crisis_hide_{section_key}"):
+        state["hidden"] = True
+        return
+    if state.get("acknowledged"):
+        st.info("Thanks for checking in. Support options are below if you need them.")
+
+    resources_resp = api_get("/safety/resources")
+    if resources_resp is not None and resources_resp.ok:
+        resources = safe_json(resources_resp) or {}
+        st.subheader("Safety resources")
+        for item in resources.get("us", []):
+            st.write(f"- {item.get('label')}: {item.get('note')}")
+        for item in resources.get("international", []):
+            st.write(f"- {item}")
+        st.caption(resources.get("safety_note", ""))
+    elif resources_resp is not None:
+        show_response_error(resources_resp, "/safety/resources", "Unable to load safety resources.")
+
+
+def render_grounding_suggestions() -> None:
+    st.subheader("Grounding suggestions")
+    st.write("- Try 4-7-8 breathing for a minute.")
+    st.write("- Drink a glass of water.")
+    st.write("- Contact a trusted person or stay near someone safe.")
+
+
 def api_get(path: str):
     try:
         return requests.get(api_url(path), headers=api_headers(), timeout=10)
@@ -118,7 +158,8 @@ daily_tab_label = "Daily Check-in"
 journal_tab_label = "Journal"
 insights_tab_label = "Insights"
 export_tab_label = "Export"
-home_tab, micro_tab, daily_tab, journal_tab, insights_tab, export_tab = st.tabs(
+safety_tab_label = "Safety"
+home_tab, micro_tab, daily_tab, journal_tab, insights_tab, export_tab, safety_tab = st.tabs(
     [
         home_tab_label,
         micro_tab_label,
@@ -126,6 +167,7 @@ home_tab, micro_tab, daily_tab, journal_tab, insights_tab, export_tab = st.tabs(
         journal_tab_label,
         insights_tab_label,
         export_tab_label,
+        safety_tab_label,
     ]
 )
 
@@ -560,6 +602,9 @@ with daily_tab:
                     resp = api_post("/answers", json=payload)
                     if resp is not None and resp.ok:
                         payload = safe_json(resp) or {}
+                        if payload.get("crisis"):
+                            render_crisis_banner(payload.get("crisis"), "daily_save")
+                            render_grounding_suggestions()
                         if payload.get("is_low_quality"):
                             st.warning(f"Low quality: {payload.get('reason_summary', '')}. Try adding 1-2 sentences.")
                             st.info("You can edit your answers and resubmit.")
@@ -611,6 +656,9 @@ with daily_tab:
                         updated = safe_json(resp) or {}
                         st.session_state.eval_daily = updated
                         st.session_state.eval_daily_followups = []
+                        if updated.get("crisis"):
+                            render_crisis_banner(updated.get("crisis"), "daily_followup")
+                            render_grounding_suggestions()
                         st.success("Thanks, follow-up saved.")
                     elif resp is not None:
                         show_response_error(resp, "/evaluate/followup", "Unable to submit follow-up.")
@@ -619,6 +667,9 @@ with daily_tab:
             eval_result = st.session_state.eval_daily
             st.subheader("Evaluation Summary")
             st.write(f"Risk: {eval_result.get('risk_level')} | Score: {eval_result.get('risk_score')}")
+            if eval_result.get("crisis"):
+                render_crisis_banner(eval_result.get("crisis"), "daily_eval")
+                render_grounding_suggestions()
             quality = eval_result.get("quality", {})
             if quality.get("is_suspected_fake"):
                 st.warning(f"Low quality: {quality.get('reason_summary', '')}. Try adding 1-2 sentences.")
@@ -730,6 +781,9 @@ with daily_tab:
         result = st.session_state.get("rapid_result")
         if result:
             st.subheader("Rapid results")
+            if result.get("crisis"):
+                render_crisis_banner(result.get("crisis"), "rapid_result")
+                render_grounding_suggestions()
             st.metric("Risk level", result.get("level", "unknown"))
             st.write("Score:", result.get("score", 0))
             confidence_score = result.get("confidence_score")
@@ -782,6 +836,9 @@ with daily_tab:
                         updated = safe_json(resp) or {}
                         st.session_state.eval_rapid = updated
                         st.session_state.eval_rapid_followups = []
+                        if updated.get("crisis"):
+                            render_crisis_banner(updated.get("crisis"), "rapid_followup")
+                            render_grounding_suggestions()
                         st.success("Thanks, follow-up saved.")
                     elif resp is not None:
                         show_response_error(resp, "/evaluate/followup", "Unable to submit follow-up.")
@@ -800,27 +857,34 @@ with daily_tab:
                 )
 
             st.subheader("Action Plan")
-            micro_signal = result.get("micro_signal", {})
-            insights = st.session_state.get("baseline_insights") or {}
-            baseline_z = insights.get("z_score") if insights.get("baseline_ready") else None
-            plan_payload = {
-                "risk_level": result.get("level", "green"),
-                "confidence": confidence_label.lower(),
-                "baseline_deviation_z": baseline_z,
-                "micro_streak_days": micro_signal.get("streak_days", 0),
-                "answered_last_7_days": micro_signal.get("answered_last_7_days", 0),
-                "self_harm_flag": any(
-                    "self-harm" in (item.get("reason", "").lower())
-                    for item in explanations
-                ),
-            }
-            plan_resp = api_post("/plan/generate", json=plan_payload)
-            if plan_resp is not None and plan_resp.ok:
-                st.session_state.action_plan_rapid = safe_json(plan_resp) or {}
-            elif plan_resp is not None:
-                show_response_error(plan_resp, "/plan/generate", "Unable to generate action plan.")
+            crisis_payload = result.get("crisis") if isinstance(result, dict) else None
+            if crisis_payload:
+                render_crisis_banner(crisis_payload, "rapid_eval")
+                render_grounding_suggestions()
+            if crisis_payload:
+                plan = {}
+            else:
+                micro_signal = result.get("micro_signal", {})
+                insights = st.session_state.get("baseline_insights") or {}
+                baseline_z = insights.get("z_score") if insights.get("baseline_ready") else None
+                plan_payload = {
+                    "risk_level": result.get("level", "green"),
+                    "confidence": confidence_label.lower(),
+                    "baseline_deviation_z": baseline_z,
+                    "micro_streak_days": micro_signal.get("streak_days", 0),
+                    "answered_last_7_days": micro_signal.get("answered_last_7_days", 0),
+                    "self_harm_flag": any(
+                        "self-harm" in (item.get("reason", "").lower())
+                        for item in explanations
+                    ),
+                }
+                plan_resp = api_post("/plan/generate", json=plan_payload)
+                if plan_resp is not None and plan_resp.ok:
+                    st.session_state.action_plan_rapid = safe_json(plan_resp) or {}
+                elif plan_resp is not None:
+                    show_response_error(plan_resp, "/plan/generate", "Unable to generate action plan.")
 
-            plan = st.session_state.action_plan_rapid
+                plan = st.session_state.action_plan_rapid
             if plan:
                 tabs = st.tabs(["Next 15 minutes", "Next 24 hours", "Resources"])
                 with tabs[0]:
@@ -890,6 +954,9 @@ with journal_tab:
                 resp = api_post("/journal", json=payload)
                 if resp is not None and resp.ok:
                     payload = safe_json(resp) or {}
+                    if payload.get("crisis"):
+                        render_crisis_banner(payload.get("crisis"), "journal_save")
+                        render_grounding_suggestions()
                     if payload.get("is_low_quality"):
                         st.warning(f"Low quality: {payload.get('reason_summary', '')}. Try adding 1-2 sentences.")
                         st.info("You can edit and resubmit if you'd like.")
@@ -1032,6 +1099,37 @@ with export_tab:
                 )
             elif resp is not None:
                 show_response_error(resp, "/import/anonymized", "Import failed.")
+
+with safety_tab:
+    st.subheader("Safety")
+    st.caption("Not medical advice. If you feel unsafe, contact local emergency services.")
+    resources_resp = api_get("/safety/resources")
+    if resources_resp is not None and resources_resp.ok:
+        resources = safe_json(resources_resp) or {}
+        st.write("U.S.")
+        for item in resources.get("us", []):
+            st.write(f"- {item.get('label')}: {item.get('note')}")
+        st.write("International")
+        for item in resources.get("international", []):
+            st.write(f"- {item}")
+        st.caption(resources.get("safety_note", ""))
+    elif resources_resp is not None:
+        show_response_error(resources_resp, "/safety/resources", "Unable to load safety resources.")
+
+    if st.session_state.ui_dev_mode:
+        st.subheader("Recent crisis events (dev)")
+        events_resp = api_get("/safety/events?days=30")
+        if events_resp is not None and events_resp.ok:
+            events = safe_json(events_resp) or []
+            if events:
+                for event in events:
+                    st.write(
+                        f"{event.get('entry_date')} | {event.get('source')} | {event.get('level')}"
+                    )
+            else:
+                st.info("No crisis events recorded.")
+        elif events_resp is not None:
+            show_response_error(events_resp, "/safety/events", "Unable to load crisis events.")
 with insights_tab:
     st.subheader("Insights")
     st.caption("Not a diagnosis. If you feel unsafe contact local emergency services.")

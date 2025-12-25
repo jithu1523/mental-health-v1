@@ -25,6 +25,7 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import Session, relationship, sessionmaker
 
 from .evaluation_engine import evaluate as run_evaluation
+from .crisis_detector import detect_crisis
 from .baseline_engine import (
     compute_baseline_snapshot,
     compute_drift,
@@ -148,6 +149,20 @@ class BaselineSnapshot(Base):
     computed_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     window_days = Column(Integer, nullable=False, default=14)
     json_payload = Column(String, nullable=False)
+
+
+class CrisisEvent(Base):
+    __tablename__ = "crisis_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    entry_date = Column(Date, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    source = Column(String, nullable=False)
+    level = Column(String, nullable=False)
+    matched_terms_json = Column(String, nullable=False, default="[]")
+    snippet = Column(String, nullable=True)
+    risk_score_at_time = Column(Integer, nullable=True)
 
 
 class MicroQuestion(Base):
@@ -293,6 +308,7 @@ class JournalResponse(BaseModel):
     input_quality_flags: Optional[List[str]] = None
     is_low_quality: Optional[bool] = None
     reason_summary: Optional[str] = None
+    crisis: Optional[dict] = None
 
 
 class RiskResponse(BaseModel):
@@ -415,6 +431,7 @@ class RapidSubmitResponse(BaseModel):
     signals: List[str]
     recommended_actions: List[str]
     crisis_guidance: Optional[List[str]] = None
+    crisis: Optional[dict] = None
     confidence_score: float
     explanations: List[RapidExplainabilityItem]
     is_valid: bool
@@ -952,6 +969,52 @@ def meta() -> dict:
     return {"dev_mode": is_dev_mode()}
 
 
+@app.get("/safety/resources")
+def safety_resources() -> dict:
+    return {
+        "us": [
+            {"label": "988 Lifeline", "note": "Call or text 988 in the U.S. for immediate support."},
+            {"label": "Emergency", "note": "If you are in immediate danger, call 911 or local emergency services."},
+        ],
+        "international": [
+            "If you are outside the U.S., contact local emergency services or a local crisis line.",
+            "If you are in immediate danger, seek urgent help right away.",
+        ],
+        "safety_note": "This app is not medical advice. If you feel unsafe, seek immediate support.",
+    }
+
+
+@app.get("/safety/events")
+def safety_events(
+    days: int = Query(30, ge=1, le=365),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> List[dict]:
+    if not is_dev_mode():
+        raise HTTPException(status_code=403, detail="Developer mode disabled")
+    start_date = date.today() - timedelta(days=days - 1)
+    events = (
+        db.query(CrisisEvent)
+        .filter(
+            CrisisEvent.user_id == user.id,
+            CrisisEvent.entry_date >= start_date,
+        )
+        .order_by(CrisisEvent.created_at.desc())
+        .limit(50)
+        .all()
+    )
+    return [
+        {
+            "entry_date": event.entry_date.isoformat(),
+            "source": event.source,
+            "level": event.level,
+            "matched_terms": json.loads(event.matched_terms_json or "[]"),
+            "created_at": event.created_at.isoformat(),
+        }
+        for event in events
+    ]
+
+
 def is_dev_mode() -> bool:
     value = os.getenv("MINDTRIAGE_DEV_MODE", "").strip().lower()
     alt = os.getenv("DEV_MODE", "").strip().lower()
@@ -1465,6 +1528,20 @@ def evaluate_endpoint(
         rapid_answers=payload.rapid_answers,
         duration_seconds=payload.duration_seconds,
     )
+    hopeless_value = None
+    if payload.daily_answers:
+        hopeless_value = payload.daily_answers.get("daily_hopeless")
+    crisis_payload = detect_crisis(
+        texts=[
+            payload.journal_text or "",
+            json.dumps(payload.daily_answers or {}),
+            json.dumps(payload.rapid_answers or {}),
+        ],
+        structured={
+            "risk_score": result.risk_score,
+            "hopelessness_score": 10 if hopeless_value and indicates_hopeless(str(hopeless_value)) else None,
+        },
+    )
     session_id = uuid.uuid4().hex
     session = EvaluationSession(
         id=session_id,
@@ -1503,6 +1580,7 @@ def evaluate_endpoint(
             "is_suspected_fake": result.quality.is_suspected_fake,
             "reason_summary": result.quality.reason_summary,
         },
+        "crisis": crisis_payload if crisis_payload.get("is_crisis") else None,
         "recommended_followups": result.recommended_followups,
     }
 
@@ -1542,6 +1620,15 @@ def evaluate_followup_endpoint(
         duration_seconds=inputs.get("duration_seconds"),
         followup_answers=payload.answers,
     )
+    crisis_payload = detect_crisis(
+        texts=[
+            inputs.get("journal_text") or "",
+            json.dumps(inputs.get("daily_answers") or {}),
+            json.dumps(inputs.get("rapid_answers") or {}),
+            json.dumps(payload.answers or {}),
+        ],
+        structured={"risk_score": result.risk_score},
+    )
     session.result_json = json.dumps({
         "risk_score": result.risk_score,
         "risk_level": result.risk_level,
@@ -1567,6 +1654,7 @@ def evaluate_followup_endpoint(
             "is_suspected_fake": result.quality.is_suspected_fake,
             "reason_summary": result.quality.reason_summary,
         },
+        "crisis": crisis_payload if crisis_payload.get("is_crisis") else None,
         "recommended_followups": [],
     }
 
@@ -1676,6 +1764,7 @@ def submit_answers(
         quality = assess_structured_quality(current_texts, recent_texts, short_window_count)
 
     daily_category_map = build_daily_category_map(db) if is_daily else {}
+    answer_slug_map: dict[str, str] = {}
     created = []
     for item in payload.answers:
         entry_date = item.entry_date or today
@@ -1691,6 +1780,7 @@ def submit_answers(
                 category = daily_category_map.get(question.id)
             else:
                 category = question.kind
+            answer_slug_map[question.slug] = item.answer_text.strip()
 
         existing = (
             db.query(Answer)
@@ -1730,7 +1820,37 @@ def submit_answers(
     update_user_baseline(user.id, db)
     if is_daily and quality and not quality["is_low_quality"]:
         store_baseline_snapshot(user.id, db)
-    response = {"saved": len(created), "micro_signal": build_micro_signal(user.id, db)}
+    crisis_payload = None
+    if is_daily:
+        answer_texts = [item.answer_text for item in payload.answers]
+        mood_value = answer_slug_map.get("daily_mood")
+        anxiety_value = answer_slug_map.get("daily_anxiety")
+        hopeless_value = answer_slug_map.get("daily_hopeless")
+        structured = {
+            "risk_score": None,
+            "mood_score": parse_numeric(mood_value or "") if mood_value else None,
+            "anxiety_score": parse_numeric(anxiety_value or "") if anxiety_value else None,
+            "hopelessness_score": 10 if hopeless_value and indicates_hopeless(hopeless_value) else None,
+        }
+        crisis_payload = detect_crisis(texts=answer_texts, structured=structured)
+        if crisis_payload.get("is_crisis"):
+            snippet = " | ".join(answer_texts)[:200]
+            record_crisis_event(
+                user_id=user.id,
+                entry_date=today,
+                source="daily",
+                level=crisis_payload["level"],
+                matched_terms=crisis_payload.get("matched_terms", []),
+                snippet=snippet,
+                risk_score=None,
+                db=db,
+            )
+            db.commit()
+    response = {
+        "saved": len(created),
+        "micro_signal": build_micro_signal(user.id, db),
+        "crisis": crisis_payload if crisis_payload and crisis_payload.get("is_crisis") else None,
+    }
     if is_daily:
         response.update({
             "input_quality_score": quality["quality_score"] if quality else None,
@@ -1816,6 +1936,19 @@ def create_journal_entry(
     db.commit()
     db.refresh(entry)
     update_user_baseline(user.id, db)
+    crisis_payload = detect_crisis(texts=[entry.content], structured={})
+    if crisis_payload.get("is_crisis"):
+        record_crisis_event(
+            user_id=user.id,
+            entry_date=entry.entry_date or date.today(),
+            source="journal",
+            level=crisis_payload["level"],
+            matched_terms=crisis_payload.get("matched_terms", []),
+            snippet=entry.content[:200],
+            risk_score=None,
+            db=db,
+        )
+        db.commit()
     return JournalResponse(
         id=entry.id,
         content=entry.content,
@@ -1824,6 +1957,7 @@ def create_journal_entry(
         input_quality_flags=quality["flags"],
         is_low_quality=entry.is_low_quality,
         reason_summary=quality["reason_summary"],
+        crisis=crisis_payload if crisis_payload.get("is_crisis") else None,
     )
 
 
@@ -2134,6 +2268,15 @@ def rapid_submit(
         answers_by_slug[question["slug"]] = answer.answer_text.strip()
 
     level, score, signals, explanations, actions, crisis = compute_rapid_risk(answers_by_slug)
+    crisis_payload = detect_crisis(
+        texts=list(answers_by_slug.values()),
+        structured={
+            "risk_score": score,
+            "self_harm_thoughts": is_yes(answers_by_slug.get("rapid_self_harm_thoughts", "")) is True,
+            "self_harm_plan": is_yes(answers_by_slug.get("rapid_self_harm_plan", "")) is True,
+            "hopelessness_score": 10 if is_yes(answers_by_slug.get("rapid_hopeless", "")) else None,
+        },
+    )
     today = date.today()
     entry_date = payload.entry_date or (active_session.entry_date if active_session else today)
     if not is_dev_mode():
@@ -2248,6 +2391,19 @@ def rapid_submit(
     update_user_baseline(user.id, db)
     if not quality["is_low_quality"]:
         store_baseline_snapshot(user.id, db)
+    if crisis_payload.get("is_crisis"):
+        snippet = " | ".join(answers_by_slug.values())[:200]
+        record_crisis_event(
+            user_id=user.id,
+            entry_date=entry_date,
+            source="rapid",
+            level=crisis_payload["level"],
+            matched_terms=crisis_payload.get("matched_terms", []),
+            snippet=snippet,
+            risk_score=score,
+            db=db,
+        )
+        db.commit()
 
     return RapidSubmitResponse(
         level=level,
@@ -2255,6 +2411,7 @@ def rapid_submit(
         signals=signals,
         recommended_actions=actions,
         crisis_guidance=crisis,
+        crisis=crisis_payload if crisis_payload.get("is_crisis") else None,
         confidence_score=confidence_score,
         explanations=top_explanations,
         is_valid=is_valid,
@@ -2962,6 +3119,41 @@ def crisis_resources() -> List[str]:
         "Reach out to a trusted person or local crisis line.",
         "If you are in the U.S., you can call or text 988 for immediate support.",
     ]
+
+
+def record_crisis_event(
+    user_id: int,
+    entry_date: date,
+    source: str,
+    level: str,
+    matched_terms: List[str],
+    snippet: Optional[str],
+    risk_score: Optional[int],
+    db: Session,
+) -> None:
+    existing = (
+        db.query(CrisisEvent)
+        .filter(
+            CrisisEvent.user_id == user_id,
+            CrisisEvent.entry_date == entry_date,
+            CrisisEvent.source == source,
+            CrisisEvent.level == level,
+        )
+        .order_by(CrisisEvent.created_at.desc())
+        .first()
+    )
+    if existing and snippet and existing.snippet == snippet:
+        return
+    db.add(CrisisEvent(
+        user_id=user_id,
+        entry_date=entry_date,
+        created_at=datetime.utcnow(),
+        source=source,
+        level=level,
+        matched_terms_json=json.dumps(matched_terms),
+        snippet=snippet,
+        risk_score_at_time=risk_score,
+    ))
 
 
 def compute_rapid_confidence_score(time_taken_seconds: float, quality_flags: List[str]) -> float:
