@@ -1141,36 +1141,66 @@ with insights_tab:
         elif history_resp is not None:
             show_response_error(history_resp, "/risk/history", "Unable to load risk history.")
 
-        st.subheader("Your Baseline")
-        baseline_resp = api_get("/baseline/summary")
-        insights_resp = api_get("/insights/today")
-        if baseline_resp is not None and baseline_resp.ok:
-            baseline = safe_json(baseline_resp) or {}
-            if baseline.get("baseline_ready"):
-                st.success("Baseline ready.")
-                st.write(
-                    f"Mean score: {baseline.get('mean', 0)} | "
-                    f"Std: {baseline.get('std', 0)} | "
-                    f"Samples: {baseline.get('sample_count', 0)}"
-                )
+        st.subheader("Baseline (last 14 days)")
+        drift_date = None
+        if st.session_state.ui_dev_mode:
+            drift_date = st.date_input("Drift date (dev)", value=date.today(), key="drift_date")
+        drift_query = "/insights/drift"
+        if drift_date:
+            drift_query += f"?date={drift_date.isoformat()}"
+        if st.session_state.ui_dev_mode and st.session_state.include_low_quality:
+            drift_query += "&include_low_quality=true" if "?" in drift_query else "?include_low_quality=true"
+        drift_resp = api_get(drift_query)
+        if drift_resp is not None and drift_resp.ok:
+            drift_payload = safe_json(drift_resp) or {}
+            baseline_payload = drift_payload.get("baseline", {})
+            signal_stats = baseline_payload.get("signals", {}) or {}
+            baseline_ready = any(stat.get("mean") is not None for stat in signal_stats.values())
+            if baseline_ready:
+                coverages = [
+                    stat.get("coverage_percent", 0)
+                    for stat in signal_stats.values()
+                    if stat.get("coverage_percent") is not None
+                ]
+                avg_coverage = round(sum(coverages) / len(coverages), 1) if coverages else 0
+                st.write(f"Coverage: {avg_coverage}% of the last {baseline_payload.get('window_days', 14)} days.")
+                cols = st.columns(2)
+                for idx, (key, label, unit) in enumerate([
+                    ("mood_score", "Mood", ""),
+                    ("anxiety_score", "Anxiety", ""),
+                    ("sleep_hours", "Sleep", "h"),
+                    ("energy_score", "Energy", ""),
+                ]):
+                    mean_value = signal_stats.get(key, {}).get("mean")
+                    if mean_value is not None:
+                        cols[idx % 2].write(f"{label} mean: {mean_value}{unit}")
             else:
-                st.info("Baseline building. Complete at least 5 check-ins.")
-        elif baseline_resp is not None:
-            show_response_error(baseline_resp, "/baseline/summary", "Unable to load baseline summary.")
+                st.info("Baseline building. Add more high-quality check-ins to improve coverage.")
 
+            st.subheader("Today vs Baseline")
+            top_changes = drift_payload.get("top_changes", [])
+            if top_changes:
+                for change in top_changes:
+                    message = change.get("message") or f"{change.get('signal')}: {change.get('delta')}"
+                    st.write(f"- {message} (Δ {change.get('delta')})")
+            else:
+                st.write("No meaningful changes yet.")
+
+            st.subheader("Confidence meter")
+            confidence = drift_payload.get("confidence", 0)
+            st.write(f"Confidence: {int(confidence * 100)}%")
+            recommendations = drift_payload.get("recommendations", [])
+            if recommendations:
+                st.subheader("Drift suggestions")
+                for item in recommendations:
+                    st.write(f"- {item}")
+        elif drift_resp is not None:
+            show_response_error(drift_resp, "/insights/drift", "Unable to load baseline drift.")
+
+        insights_resp = api_get("/insights/today")
         if insights_resp is not None and insights_resp.ok:
             insights = safe_json(insights_resp) or {}
             st.session_state.baseline_insights = insights
-            if insights.get("baseline_ready"):
-                if "today_score" in insights:
-                    st.write(
-                        f"Today's deviation: z={insights.get('z_score', 0)} "
-                        f"({insights.get('interpretation', '')})."
-                    )
-                else:
-                    st.write(insights.get("message", "No insight for today."))
-            else:
-                st.write(insights.get("message", "Baseline not ready."))
         elif insights_resp is not None:
             show_response_error(insights_resp, "/insights/today", "Unable to load insights.")
 

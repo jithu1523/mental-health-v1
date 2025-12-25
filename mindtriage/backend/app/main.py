@@ -25,6 +25,11 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import Session, relationship, sessionmaker
 
 from .evaluation_engine import evaluate as run_evaluation
+from .baseline_engine import (
+    compute_baseline_snapshot,
+    compute_drift,
+    collect_signals_for_window,
+)
 
 DATABASE_URL = "sqlite:///./mindtriage.db"
 SECRET_KEY = "CHANGE_ME"
@@ -133,6 +138,16 @@ class UserBaseline(Base):
     last_updated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     user = relationship("User", back_populates="baseline")
+
+
+class BaselineSnapshot(Base):
+    __tablename__ = "baseline_snapshots"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    computed_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    window_days = Column(Integer, nullable=False, default=14)
+    json_payload = Column(String, nullable=False)
 
 
 class MicroQuestion(Base):
@@ -1713,6 +1728,8 @@ def submit_answers(
     db.add_all([item for item in created if item.id is None])
     db.commit()
     update_user_baseline(user.id, db)
+    if is_daily and quality and not quality["is_low_quality"]:
+        store_baseline_snapshot(user.id, db)
     response = {"saved": len(created), "micro_signal": build_micro_signal(user.id, db)}
     if is_daily:
         response.update({
@@ -2229,6 +2246,8 @@ def rapid_submit(
         db.add(evaluation)
     db.commit()
     update_user_baseline(user.id, db)
+    if not quality["is_low_quality"]:
+        store_baseline_snapshot(user.id, db)
 
     return RapidSubmitResponse(
         level=level,
@@ -2749,6 +2768,82 @@ def insights_today(
         "today_score": score,
         "z_score": round(z_score, 2),
         "interpretation": interpretation,
+    }
+
+
+def store_baseline_snapshot(
+    user_id: int,
+    db: Session,
+    window_days: int = 14,
+    include_low_quality: bool = False,
+    end_date: Optional[date] = None,
+) -> dict:
+    target_end = end_date or (local_today() - timedelta(days=1))
+    if window_days < 1:
+        window_days = 1
+    payload = compute_baseline_snapshot(
+        user_id=user_id,
+        window_days=window_days,
+        include_low_quality=include_low_quality,
+        end_date=target_end,
+        db=db,
+    )
+    snapshot = BaselineSnapshot(
+        user_id=user_id,
+        computed_at=datetime.utcnow(),
+        window_days=window_days,
+        json_payload=json.dumps(payload),
+    )
+    db.add(snapshot)
+    db.commit()
+    return payload
+
+
+@app.get("/insights/drift")
+def insights_drift(
+    window_days: int = Query(14, ge=7, le=60),
+    date_override: Optional[date] = Query(None, alias="date"),
+    include_low_quality: bool = Query(False),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    if include_low_quality and not is_dev_mode():
+        include_low_quality = False
+    target_date = local_today()
+    if date_override is not None:
+        if not is_dev_mode():
+            raise HTTPException(status_code=403, detail="Developer mode disabled")
+        target_date = date_override
+
+    baseline_end = target_date - timedelta(days=1)
+    baseline_payload = store_baseline_snapshot(
+        user_id=user.id,
+        db=db,
+        window_days=window_days,
+        include_low_quality=include_low_quality,
+        end_date=baseline_end,
+    )
+
+    signals_window = collect_signals_for_window(
+        user_id=user.id,
+        start_date=target_date,
+        end_date=target_date,
+        include_low_quality=include_low_quality,
+        db=db,
+    )
+    signals_today = signals_window.get(target_date, {})
+    baseline_signals = baseline_payload.get("signals", {})
+    drift, top_changes, confidence, recommendations = compute_drift(signals_today, baseline_signals)
+
+    return {
+        "date": target_date.isoformat(),
+        "baseline_window_days": window_days,
+        "signals_today": signals_today,
+        "baseline": baseline_payload,
+        "drift": drift,
+        "top_changes": top_changes,
+        "confidence": confidence,
+        "recommendations": recommendations,
     }
 
 
