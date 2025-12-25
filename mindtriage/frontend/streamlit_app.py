@@ -375,6 +375,38 @@ with care_tab:
         elif history_resp is not None:
             show_response_error(history_resp, "/risk/history", "Unable to load risk history.")
 
+        st.subheader("Your Baseline")
+        baseline_resp = api_get("/baseline/summary")
+        insights_resp = api_get("/insights/today")
+        if baseline_resp is not None and baseline_resp.ok:
+            baseline = safe_json(baseline_resp) or {}
+            if baseline.get("baseline_ready"):
+                st.success("Baseline ready.")
+                st.write(
+                    f"Mean score: {baseline.get('mean', 0)} | "
+                    f"Std: {baseline.get('std', 0)} | "
+                    f"Samples: {baseline.get('sample_count', 0)}"
+                )
+            else:
+                st.info("Baseline building. Complete at least 5 check-ins.")
+        elif baseline_resp is not None:
+            show_response_error(baseline_resp, "/baseline/summary", "Unable to load baseline summary.")
+
+        if insights_resp is not None and insights_resp.ok:
+            insights = safe_json(insights_resp) or {}
+            if insights.get("baseline_ready"):
+                if "today_score" in insights:
+                    st.write(
+                        f"Today's deviation: z={insights.get('z_score', 0)} "
+                        f"({insights.get('interpretation', '')})."
+                    )
+                else:
+                    st.write(insights.get("message", "No insight for today."))
+            else:
+                st.write(insights.get("message", "Baseline not ready."))
+        elif insights_resp is not None:
+            show_response_error(insights_resp, "/insights/today", "Unable to load insights.")
+
 st.caption("Not a diagnosis. If you feel unsafe contact local emergency services.")
 
 with rapid_tab:

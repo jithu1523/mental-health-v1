@@ -47,6 +47,7 @@ class User(Base):
     journal_entries = relationship("JournalEntry", back_populates="user")
     answers = relationship("Answer", back_populates="user")
     onboarding_answers = relationship("OnboardingAnswer", back_populates="user")
+    baseline = relationship("UserBaseline", uselist=False, back_populates="user")
 
 
 class JournalEntry(Base):
@@ -105,6 +106,22 @@ class OnboardingAnswer(Base):
 
     user = relationship("User", back_populates="onboarding_answers")
     question = relationship("OnboardingQuestion")
+
+
+class UserBaseline(Base):
+    __tablename__ = "user_baseline"
+
+    user_id = Column(Integer, ForeignKey("users.id"), primary_key=True)
+    baseline_score_mean = Column(Float, nullable=True)
+    baseline_score_std = Column(Float, nullable=True)
+    baseline_response_time_mean = Column(Float, nullable=True)
+    baseline_response_time_std = Column(Float, nullable=True)
+    baseline_confidence_mean = Column(Float, nullable=True)
+    baseline_confidence_std = Column(Float, nullable=True)
+    sample_count = Column(Integer, nullable=False, default=0)
+    last_updated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    user = relationship("User", back_populates="baseline")
 
 
 class Question(Base):
@@ -851,6 +868,7 @@ def submit_answers(
         ))
     db.add_all(created)
     db.commit()
+    update_user_baseline(user.id, db)
     return {"saved": len(created)}
 
 
@@ -876,6 +894,7 @@ def create_journal_entry(
     db.add(entry)
     db.commit()
     db.refresh(entry)
+    update_user_baseline(user.id, db)
     return JournalResponse(id=entry.id, content=entry.content, created_at=entry.created_at)
 
 
@@ -1233,6 +1252,7 @@ def rapid_submit(
         )
         db.add(evaluation)
     db.commit()
+    update_user_baseline(user.id, db)
 
     return RapidSubmitResponse(
         level=level,
@@ -1509,6 +1529,100 @@ def metrics_summary(
         "regular": regular_summary,
         "rapid": rapid_summary,
         "safety": safety_summary,
+    }
+
+
+@app.get("/baseline/summary")
+def baseline_summary(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    baseline = update_user_baseline(user.id, db)
+    if not baseline:
+        return {
+            "baseline_ready": False,
+            "sample_count": 0,
+            "mean": None,
+            "std": None,
+            "response_time_mean": None,
+            "response_time_std": None,
+            "confidence_mean": None,
+            "confidence_std": None,
+            "recommended_personal_thresholds": None,
+        }
+    ready = baseline.sample_count >= 5
+    thresholds = None
+    if ready and baseline.baseline_score_mean is not None and baseline.baseline_score_std is not None:
+        thresholds = {
+            "low": round(max(baseline.baseline_score_mean - baseline.baseline_score_std, 0.0), 2),
+            "high": round(baseline.baseline_score_mean + baseline.baseline_score_std, 2),
+        }
+    return {
+        "baseline_ready": ready,
+        "sample_count": baseline.sample_count,
+        "mean": baseline.baseline_score_mean,
+        "std": baseline.baseline_score_std,
+        "response_time_mean": baseline.baseline_response_time_mean,
+        "response_time_std": baseline.baseline_response_time_std,
+        "confidence_mean": baseline.baseline_confidence_mean,
+        "confidence_std": baseline.baseline_confidence_std,
+        "recommended_personal_thresholds": thresholds,
+    }
+
+
+@app.get("/insights/today")
+def insights_today(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    baseline = update_user_baseline(user.id, db)
+    if not baseline or baseline.sample_count < 5 or baseline.baseline_score_mean is None:
+        return {
+            "baseline_ready": False,
+            "message": "Baseline building. Complete at least 5 check-ins.",
+        }
+
+    today = date.today()
+    answers = (
+        db.query(Answer, Question)
+        .join(Question, Answer.question_id == Question.id)
+        .filter(
+            Answer.user_id == user.id,
+            Question.kind == "daily",
+            Answer.entry_date == today,
+        )
+        .all()
+    )
+    journal = (
+        db.query(JournalEntry)
+        .filter(JournalEntry.user_id == user.id, JournalEntry.entry_date == today)
+        .order_by(JournalEntry.created_at.desc())
+        .first()
+    )
+    if not answers and not journal:
+        return {
+            "baseline_ready": True,
+            "message": "No check-in data for today.",
+        }
+
+    _, score, _, _ = compute_risk_details(answers, journal)
+    std = baseline.baseline_score_std or 0.0
+    if std > 0:
+        z_score = (score - baseline.baseline_score_mean) / std
+    else:
+        z_score = 0.0
+    if z_score >= 1:
+        interpretation = "higher than your usual"
+    elif z_score <= -1:
+        interpretation = "lower than your usual"
+    else:
+        interpretation = "within your normal range"
+
+    return {
+        "baseline_ready": True,
+        "today_score": score,
+        "z_score": round(z_score, 2),
+        "interpretation": interpretation,
     }
 
 
@@ -2051,3 +2165,122 @@ def compute_trend_slope(scores_by_day: dict[date, int], lookback_days: int) -> f
     if denominator == 0:
         return 0.0
     return numerator / denominator
+
+
+def update_user_baseline(user_id: int, db: Session, lookback_days: int = 30) -> Optional[UserBaseline]:
+    start_date = date.today() - timedelta(days=lookback_days - 1)
+
+    answers = (
+        db.query(Answer, Question)
+        .join(Question, Answer.question_id == Question.id)
+        .filter(
+            Answer.user_id == user_id,
+            Question.kind == "daily",
+            Answer.entry_date.isnot(None),
+            Answer.entry_date >= start_date,
+        )
+        .order_by(Answer.entry_date.asc(), Answer.created_at.desc())
+        .all()
+    )
+    journals = (
+        db.query(JournalEntry)
+        .filter(
+            JournalEntry.user_id == user_id,
+            JournalEntry.entry_date.isnot(None),
+            JournalEntry.entry_date >= start_date,
+        )
+        .order_by(JournalEntry.entry_date.asc(), JournalEntry.created_at.desc())
+        .all()
+    )
+
+    answers_by_date: dict[date, List[tuple[Answer, Question]]] = {}
+    for answer, question in answers:
+        answers_by_date.setdefault(answer.entry_date, []).append((answer, question))
+
+    journals_by_date: dict[date, JournalEntry] = {}
+    for entry in journals:
+        if entry.entry_date not in journals_by_date:
+            journals_by_date[entry.entry_date] = entry
+
+    daily_scores = []
+    for day in sorted(set(answers_by_date.keys()) | set(journals_by_date.keys())):
+        _, score, _, _ = compute_risk_details(
+            answers_by_date.get(day, []),
+            journals_by_date.get(day),
+        )
+        daily_scores.append(score)
+
+    rapid_scores = [
+        item.score
+        for item in db.query(RapidEvaluation)
+        .filter(
+            RapidEvaluation.user_id == user_id,
+            RapidEvaluation.entry_date.isnot(None),
+            RapidEvaluation.entry_date >= start_date,
+            RapidEvaluation.submitted_at.isnot(None),
+            RapidEvaluation.is_valid.is_(True),
+        )
+        .all()
+    ]
+
+    score_samples = daily_scores + rapid_scores
+    sample_count = len(score_samples)
+
+    baseline = db.query(UserBaseline).filter(UserBaseline.user_id == user_id).first()
+    if not baseline:
+        baseline = UserBaseline(user_id=user_id, sample_count=0)
+        db.add(baseline)
+
+    if sample_count == 0:
+        baseline.sample_count = 0
+        baseline.last_updated_at = datetime.utcnow()
+        db.commit()
+        return baseline
+
+    baseline.baseline_score_mean = round(statistics.mean(score_samples), 4)
+    baseline.baseline_score_std = round(statistics.pstdev(score_samples), 4) if sample_count >= 2 else 0.0
+    baseline.sample_count = sample_count
+
+    rapid_valid = (
+        db.query(RapidEvaluation)
+        .filter(
+            RapidEvaluation.user_id == user_id,
+            RapidEvaluation.entry_date.isnot(None),
+            RapidEvaluation.entry_date >= start_date,
+            RapidEvaluation.submitted_at.isnot(None),
+            RapidEvaluation.is_valid.is_(True),
+        )
+        .all()
+    )
+    response_times = [
+        item.time_taken_seconds
+        for item in rapid_valid
+        if item.time_taken_seconds is not None
+    ]
+    confidences = [
+        item.confidence_score
+        for item in rapid_valid
+        if item.confidence_score is not None
+    ]
+
+    if response_times:
+        baseline.baseline_response_time_mean = round(statistics.mean(response_times), 2)
+        baseline.baseline_response_time_std = round(
+            statistics.pstdev(response_times), 2
+        ) if len(response_times) >= 2 else 0.0
+    else:
+        baseline.baseline_response_time_mean = None
+        baseline.baseline_response_time_std = None
+
+    if confidences:
+        baseline.baseline_confidence_mean = round(statistics.mean(confidences), 4)
+        baseline.baseline_confidence_std = round(
+            statistics.pstdev(confidences), 4
+        ) if len(confidences) >= 2 else 0.0
+    else:
+        baseline.baseline_confidence_mean = None
+        baseline.baseline_confidence_std = None
+
+    baseline.last_updated_at = datetime.utcnow()
+    db.commit()
+    return baseline
