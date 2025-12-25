@@ -295,6 +295,7 @@ class RapidSubmitResponse(BaseModel):
     is_valid: bool
     quality_flags: List[str]
     time_taken_seconds: float
+    micro_signal: dict
     entry_date: str
 
 
@@ -1002,12 +1003,29 @@ def micro_history(
         value = json.loads(answer.value_json).get("value")
         history.append({
             "entry_date": answer.entry_date.isoformat(),
-            "prompt": question.prompt,
+            "question": question.prompt,
             "category": question.category,
             "value": value,
-            "question_type": question.question_type,
+            "created_at": answer.created_at.isoformat(),
         })
     return history
+
+
+@app.get("/micro/streak")
+def micro_streak(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    dates = fetch_micro_dates(user.id, db)
+    today = date.today()
+    answered_today = today in dates
+    current_streak = compute_current_streak(dates, today)
+    best_streak = compute_best_streak(dates)
+    return {
+        "current_streak_days": current_streak,
+        "best_streak_days": best_streak,
+        "answered_today": answered_today,
+    }
 
 
 def is_recent_mood_or_anxiety_low(user_id: int, db: Session) -> bool:
@@ -1088,7 +1106,8 @@ def submit_answers(
     db.add_all(created)
     db.commit()
     update_user_baseline(user.id, db)
-    return {"saved": len(created)}
+    micro_signal = build_micro_signal(user.id, db)
+    return {"saved": len(created), "micro_signal": micro_signal}
 
 
 @app.post("/journal", response_model=JournalResponse)
@@ -1435,7 +1454,8 @@ def rapid_submit(
     quality_flags = list(dict.fromkeys(invalid_flags + soft_flags))
     is_valid = len(invalid_flags) == 0
     confidence_score = compute_rapid_confidence_score(time_taken_seconds, quality_flags)
-    confidence_score = apply_micro_confidence_bonus(user.id, db, confidence_score)
+    micro_signal = build_micro_signal(user.id, db)
+    confidence_score = apply_micro_confidence_bonus(confidence_score, micro_signal)
 
     explanations_sorted = sorted(explanations, key=lambda item: item.weight, reverse=True)
     top_explanations = explanations_sorted[:3]
@@ -1485,6 +1505,7 @@ def rapid_submit(
         is_valid=is_valid,
         quality_flags=quality_flags,
         time_taken_seconds=time_taken_seconds,
+        micro_signal=micro_signal,
         entry_date=entry_date.isoformat(),
     )
 
@@ -2392,11 +2413,46 @@ def pick_micro_question_for_date(target_date: date, questions: List[MicroQuestio
     return questions[index]
 
 
-def apply_micro_confidence_bonus(user_id: int, db: Session, confidence_score: float) -> float:
-    if confidence_score >= 0.95:
-        return confidence_score
-    start_date = date.today() - timedelta(days=6)
-    count = (
+def fetch_micro_dates(user_id: int, db: Session) -> List[date]:
+    rows = (
+        db.query(MicroAnswer.entry_date)
+        .filter(MicroAnswer.user_id == user_id)
+        .distinct()
+        .all()
+    )
+    return sorted({row[0] for row in rows if row[0]})
+
+
+def compute_current_streak(dates: List[date], today: date) -> int:
+    if not dates:
+        return 0
+    date_set = set(dates)
+    streak = 0
+    day = today
+    while day in date_set:
+        streak += 1
+        day = day - timedelta(days=1)
+    return streak
+
+
+def compute_best_streak(dates: List[date]) -> int:
+    if not dates:
+        return 0
+    best = 1
+    current = 1
+    for prev, curr in zip(dates, dates[1:]):
+        if curr == prev + timedelta(days=1):
+            current += 1
+            best = max(best, current)
+        else:
+            current = 1
+    return best
+
+
+def build_micro_signal(user_id: int, db: Session) -> dict:
+    today = date.today()
+    start_date = today - timedelta(days=6)
+    count_last_7 = (
         db.query(MicroAnswer)
         .filter(
             MicroAnswer.user_id == user_id,
@@ -2404,9 +2460,26 @@ def apply_micro_confidence_bonus(user_id: int, db: Session, confidence_score: fl
         )
         .count()
     )
-    if count >= 5:
-        return min(0.95, confidence_score + 0.03)
-    return confidence_score
+    dates = fetch_micro_dates(user_id, db)
+    streak_days = compute_current_streak(dates, today)
+    confidence_bonus = 0.0
+    if count_last_7 >= 5:
+        confidence_bonus += 0.03
+    if streak_days >= 3:
+        confidence_bonus += 0.02
+    confidence_bonus = min(0.05, confidence_bonus)
+    return {
+        "answered_last_7_days": count_last_7,
+        "streak_days": streak_days,
+        "confidence_bonus": round(confidence_bonus, 3),
+    }
+
+
+def apply_micro_confidence_bonus(confidence_score: float, micro_signal: dict) -> float:
+    bonus = micro_signal.get("confidence_bonus", 0.0)
+    if bonus <= 0:
+        return confidence_score
+    return min(0.95, confidence_score + bonus)
 
 
 def update_user_baseline(user_id: int, db: Session, lookback_days: int = 30) -> Optional[UserBaseline]:

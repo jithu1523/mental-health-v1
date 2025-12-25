@@ -264,12 +264,22 @@ with care_tab:
         elif micro_resp is not None:
             show_response_error(micro_resp, "/micro/today", "Unable to load quick check-in.")
 
+        streak_resp = api_get("/micro/streak")
+        if streak_resp is not None and streak_resp.ok:
+            streak = safe_json(streak_resp) or {}
+            st.write(f"Micro streak: {streak.get('current_streak_days', 0)} days")
+        elif streak_resp is not None:
+            show_response_error(streak_resp, "/micro/streak", "Unable to load micro streak.")
+
         history_resp = api_get("/micro/history?days=7")
         if history_resp is not None and history_resp.ok:
             history = safe_json(history_resp) or []
             if history:
                 st.caption("Last 7 days")
-                st.write(", ".join(f"{item['entry_date']}: {item['value']}" for item in history))
+                for item in history:
+                    st.write(f"{item.get('entry_date')}: {item.get('value')}")
+            else:
+                st.info("No quick check-ins yet.")
         elif history_resp is not None:
             show_response_error(history_resp, "/micro/history", "Unable to load quick check-in history.")
 
