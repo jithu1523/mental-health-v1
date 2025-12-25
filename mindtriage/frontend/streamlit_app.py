@@ -269,7 +269,7 @@ with care_tab:
             history = safe_json(history_resp) or []
             if history:
                 st.caption("Last 7 days")
-                st.write(", ".join(f\"{item['entry_date']}: {item['value']}\" for item in history))
+                st.write(", ".join(f"{item['entry_date']}: {item['value']}" for item in history))
         elif history_resp is not None:
             show_response_error(history_resp, "/micro/history", "Unable to load quick check-in history.")
 
