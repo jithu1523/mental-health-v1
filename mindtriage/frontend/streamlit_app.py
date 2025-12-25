@@ -276,12 +276,23 @@ with care_tab:
             history = safe_json(history_resp) or []
             if history:
                 st.caption("Last 7 days")
-                for item in history:
-                    st.write(f"{item.get('entry_date')}: {item.get('value')}")
+                st.table(history)
             else:
                 st.info("No quick check-ins yet.")
         elif history_resp is not None:
             show_response_error(history_resp, "/micro/history", "Unable to load quick check-in history.")
+
+        if st.session_state.dev_mode:
+            debug_resp = api_get("/dev/debug/micro")
+            if debug_resp is not None and debug_resp.ok:
+                debug_data = safe_json(debug_resp) or {}
+                st.caption("Dev debug")
+                st.write(f"Total micro answers: {debug_data.get('count_micro_answers_total', 0)}")
+                last_items = debug_data.get("last_5_micro_answers", [])
+                if last_items:
+                    st.write(f"Last entry date: {last_items[0].get('entry_date')}")
+            elif debug_resp is not None:
+                show_response_error(debug_resp, "/dev/debug/micro", "Unable to load micro debug data.")
 
         profile = status.get("profile", {})
         total_questions = profile.get("total_questions", 0)

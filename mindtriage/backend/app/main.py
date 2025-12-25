@@ -969,16 +969,24 @@ def micro_answer(
         existing.question_id = question.id
         existing.value_json = json.dumps({"value": value})
         existing.created_at = datetime.utcnow()
+        saved = existing
     else:
-        db.add(MicroAnswer(
+        saved = MicroAnswer(
             user_id=user.id,
             question_id=question.id,
             entry_date=entry_date,
             value_json=json.dumps({"value": value}),
-        ))
+        )
+        db.add(saved)
     db.commit()
     update_user_baseline(user.id, db)
-    return {"saved": True}
+    return {
+        "saved": True,
+        "entry_date": saved.entry_date.isoformat(),
+        "created_at": saved.created_at.isoformat(),
+        "question_id": saved.question_id,
+        "value_json": saved.value_json,
+    }
 
 
 @app.get("/micro/history")
@@ -993,9 +1001,9 @@ def micro_history(
         .join(MicroQuestion, MicroAnswer.question_id == MicroQuestion.id)
         .filter(
             MicroAnswer.user_id == user.id,
-            MicroAnswer.entry_date >= start_date,
+            func.date(MicroAnswer.entry_date) >= start_date.isoformat(),
         )
-        .order_by(MicroAnswer.entry_date.asc())
+        .order_by(MicroAnswer.entry_date.desc(), MicroAnswer.created_at.desc())
         .all()
     )
     history = []
@@ -1009,6 +1017,42 @@ def micro_history(
             "created_at": answer.created_at.isoformat(),
         })
     return history
+
+
+@app.get("/dev/debug/micro")
+def debug_micro(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    if not is_dev_mode():
+        raise HTTPException(status_code=404, detail="Not found")
+    total = (
+        db.query(MicroAnswer)
+        .filter(MicroAnswer.user_id == user.id)
+        .count()
+    )
+    last_rows = (
+        db.query(MicroAnswer)
+        .filter(MicroAnswer.user_id == user.id)
+        .order_by(MicroAnswer.created_at.desc())
+        .limit(5)
+        .all()
+    )
+    last_items = [
+        {
+            "entry_date": row.entry_date.isoformat() if row.entry_date else None,
+            "created_at": row.created_at.isoformat(),
+            "question_id": row.question_id,
+            "value_json": row.value_json,
+        }
+        for row in last_rows
+    ]
+    return {
+        "count_micro_answers_total": total,
+        "last_5_micro_answers": last_items,
+        "server_today_date": date.today().isoformat(),
+        "timezone": str(datetime.now().astimezone().tzinfo),
+    }
 
 
 @app.get("/micro/streak")
