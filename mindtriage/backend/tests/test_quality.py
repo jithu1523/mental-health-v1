@@ -21,6 +21,10 @@ class QualityTests(unittest.TestCase):
         result = main.assess_input_quality("asdfghjkl", [], 0)
         self.assertIn("keyboard_smash", result["flags"])
 
+    def test_structured_quality_duplicate(self):
+        result = main.assess_structured_quality(["same answer", "same answer"], [], 0)
+        self.assertIn("repeated_across_fields", result["flags"])
+
     def test_retry_after_window(self):
         oldest = datetime.utcnow() - timedelta(seconds=1800)
         retry_after = main.calculate_retry_after(oldest)

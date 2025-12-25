@@ -13,7 +13,7 @@ from hashlib import sha256
 import statistics
 from typing import List, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
@@ -155,6 +155,9 @@ class MicroAnswer(Base):
     value_json = Column(String, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     answered_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    input_quality_score = Column(Integer, nullable=True)
+    input_quality_flags_json = Column(String, nullable=False, default="[]")
+    is_low_quality = Column(Boolean, default=False, nullable=False)
 
     __table_args__ = (
         UniqueConstraint("user_id", "question_id", "answered_at", name="uq_micro_user_question_time"),
@@ -204,6 +207,9 @@ class Answer(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     entry_date = Column(Date, default=date.today, nullable=True)
     is_demo = Column(Boolean, default=False, nullable=False)
+    input_quality_score = Column(Integer, nullable=True)
+    input_quality_flags_json = Column(String, nullable=False, default="[]")
+    is_low_quality = Column(Boolean, default=False, nullable=False)
 
     user = relationship("User", back_populates="answers")
     question = relationship("Question")
@@ -740,6 +746,22 @@ def ensure_quality_columns() -> None:
             connection.execute(text("ALTER TABLE rapid_evaluations ADD COLUMN input_quality_flags_json TEXT DEFAULT '[]'"))
         if "is_low_quality" not in rapid_columns:
             connection.execute(text("ALTER TABLE rapid_evaluations ADD COLUMN is_low_quality BOOLEAN DEFAULT 0"))
+
+        answer_columns = {row[1] for row in connection.execute(text("PRAGMA table_info(answers)"))}
+        if "input_quality_score" not in answer_columns:
+            connection.execute(text("ALTER TABLE answers ADD COLUMN input_quality_score INTEGER"))
+        if "input_quality_flags_json" not in answer_columns:
+            connection.execute(text("ALTER TABLE answers ADD COLUMN input_quality_flags_json TEXT DEFAULT '[]'"))
+        if "is_low_quality" not in answer_columns:
+            connection.execute(text("ALTER TABLE answers ADD COLUMN is_low_quality BOOLEAN DEFAULT 0"))
+
+        micro_columns = {row[1] for row in connection.execute(text("PRAGMA table_info(micro_answers)"))}
+        if "input_quality_score" not in micro_columns:
+            connection.execute(text("ALTER TABLE micro_answers ADD COLUMN input_quality_score INTEGER"))
+        if "input_quality_flags_json" not in micro_columns:
+            connection.execute(text("ALTER TABLE micro_answers ADD COLUMN input_quality_flags_json TEXT DEFAULT '[]'"))
+        if "is_low_quality" not in micro_columns:
+            connection.execute(text("ALTER TABLE micro_answers ADD COLUMN is_low_quality BOOLEAN DEFAULT 0"))
         connection.commit()
 
 
@@ -759,12 +781,19 @@ def ensure_micro_schema() -> None:
                 value_json TEXT NOT NULL,
                 created_at DATETIME NOT NULL,
                 answered_at DATETIME NOT NULL,
+                input_quality_score INTEGER,
+                input_quality_flags_json TEXT DEFAULT '[]',
+                is_low_quality BOOLEAN DEFAULT 0,
                 CONSTRAINT uq_micro_user_question_time UNIQUE (user_id, question_id, answered_at)
             )
         """))
         connection.execute(text("""
-            INSERT INTO micro_answers_new (id, user_id, question_id, entry_date, value_json, created_at, answered_at)
-            SELECT id, user_id, question_id, entry_date, value_json, created_at, created_at
+            INSERT INTO micro_answers_new (
+                id, user_id, question_id, entry_date, value_json, created_at, answered_at,
+                input_quality_score, input_quality_flags_json, is_low_quality
+            )
+            SELECT id, user_id, question_id, entry_date, value_json, created_at, created_at,
+                   NULL, '[]', 0
             FROM micro_answers
         """))
         connection.execute(text("DROP TABLE micro_answers"))
@@ -821,6 +850,11 @@ def get_current_user(
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok", "dev_mode": is_dev_mode()}
+
+
+@app.get("/meta")
+def meta() -> dict:
+    return {"dev_mode": is_dev_mode()}
 
 
 def is_dev_mode() -> bool:
@@ -1093,11 +1127,31 @@ def micro_answer(
         raise HTTPException(status_code=400, detail="Unknown micro question type.")
 
     now = datetime.utcnow()
+    recent_values = [
+        json.loads(item.value_json).get("value", "")
+        for item in db.query(MicroAnswer)
+        .filter(MicroAnswer.user_id == user.id)
+        .order_by(MicroAnswer.answered_at.desc())
+        .limit(10)
+        .all()
+    ]
+    short_window_count = (
+        db.query(MicroAnswer)
+        .filter(
+            MicroAnswer.user_id == user.id,
+            MicroAnswer.answered_at >= now - timedelta(minutes=10),
+        )
+        .count()
+    )
+    quality = assess_structured_quality([value], recent_values, short_window_count)
     if existing:
         existing.question_id = question.id
         existing.value_json = json.dumps({"value": value})
         existing.created_at = now
         existing.answered_at = now
+        existing.input_quality_score = quality["quality_score"]
+        existing.input_quality_flags_json = json.dumps(quality["flags"])
+        existing.is_low_quality = quality["is_low_quality"]
         saved = existing
     else:
         saved = MicroAnswer(
@@ -1107,6 +1161,9 @@ def micro_answer(
             value_json=json.dumps({"value": value}),
             created_at=now,
             answered_at=now,
+            input_quality_score=quality["quality_score"],
+            input_quality_flags_json=json.dumps(quality["flags"]),
+            is_low_quality=quality["is_low_quality"],
         )
         db.add(saved)
     db.commit()
@@ -1118,6 +1175,10 @@ def micro_answer(
         "answered_at": saved.answered_at.isoformat(),
         "question_id": saved.question_id,
         "value_json": saved.value_json,
+        "input_quality_score": saved.input_quality_score,
+        "input_quality_flags": quality["flags"],
+        "is_low_quality": saved.is_low_quality,
+        "reason_summary": quality["reason_summary"],
     }
 
 
@@ -1133,16 +1194,20 @@ def micro_answer_legacy(
 @app.get("/micro/history")
 def micro_history(
     days: int = Query(30, ge=1, le=365),
+    include_low_quality: bool = Query(False),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> List[dict]:
     start_date = date.today() - timedelta(days=days - 1)
+    if include_low_quality and not is_dev_mode():
+        include_low_quality = False
     rows = (
         db.query(MicroAnswer, MicroQuestion)
         .join(MicroQuestion, MicroAnswer.question_id == MicroQuestion.id)
         .filter(
             MicroAnswer.user_id == user.id,
             func.date(MicroAnswer.entry_date) >= start_date.isoformat(),
+            MicroAnswer.is_low_quality.is_(False) if not include_low_quality else True,
         )
         .order_by(MicroAnswer.entry_date.desc(), MicroAnswer.answered_at.desc())
         .all()
@@ -1156,6 +1221,9 @@ def micro_history(
             "category": question.category,
             "value": value,
             "created_at": answer.answered_at.isoformat(),
+            "input_quality_score": answer.input_quality_score,
+            "input_quality_flags": json.loads(answer.input_quality_flags_json or "[]"),
+            "is_low_quality": answer.is_low_quality,
         })
     return history
 
@@ -1235,10 +1303,13 @@ def debug_micro(
 
 @app.get("/micro/streak")
 def micro_streak(
+    include_low_quality: bool = Query(False),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
-    dates = fetch_micro_dates(user.id, db)
+    if include_low_quality and not is_dev_mode():
+        include_low_quality = False
+    dates = fetch_micro_dates(user.id, db, include_low_quality=include_low_quality)
     last_entry_date = dates[-1] if dates else None
     streak = compute_streak_from_latest(dates)
     entry_dates_last_30 = [d.isoformat() for d in dates[-30:]]
@@ -1449,6 +1520,40 @@ def submit_answers(
                     detail="entry_date must be today unless dev mode is enabled.",
                 )
 
+    quality = None
+    if is_daily:
+        recent_answers = (
+            db.query(Answer, Question)
+            .join(Question, Answer.question_id == Question.id)
+            .filter(
+                Answer.user_id == user.id,
+                Question.kind == "daily",
+            )
+            .order_by(Answer.entry_date.desc(), Answer.created_at.desc())
+            .limit(30)
+            .all()
+        )
+        recent_by_date: dict[date, List[str]] = {}
+        for answer, _question in recent_answers:
+            if answer.entry_date:
+                recent_by_date.setdefault(answer.entry_date, []).append(answer.answer_text)
+        recent_texts = [
+            " | ".join(items)
+            for _day, items in sorted(recent_by_date.items(), reverse=True)
+        ][:10]
+        short_window_count = (
+            db.query(Answer)
+            .join(Question, Answer.question_id == Question.id)
+            .filter(
+                Answer.user_id == user.id,
+                Question.kind == "daily",
+                Answer.created_at >= datetime.utcnow() - timedelta(minutes=10),
+            )
+            .count()
+        )
+        current_texts = [item.answer_text.strip() for item in payload.answers]
+        quality = assess_structured_quality(current_texts, recent_texts, short_window_count)
+
     created = []
     for item in payload.answers:
         entry_date = item.entry_date or today
@@ -1461,41 +1566,20 @@ def submit_answers(
             answer_text=item.answer_text.strip(),
             entry_date=entry_date,
             created_at=created_at,
+            input_quality_score=quality["quality_score"] if quality else None,
+            input_quality_flags_json=json.dumps(quality["flags"]) if quality else "[]",
+            is_low_quality=quality["is_low_quality"] if quality else False,
         ))
     db.add_all(created)
     db.commit()
     update_user_baseline(user.id, db)
     response = {"saved": len(created), "micro_signal": build_micro_signal(user.id, db)}
     if is_daily:
-        recent_texts = [
-            item.answer_text
-            for item in db.query(Answer)
-            .join(Question, Answer.question_id == Question.id)
-            .filter(
-                Answer.user_id == user.id,
-                Question.kind == "daily",
-            )
-            .order_by(Answer.created_at.desc())
-            .limit(10)
-            .all()
-        ]
-        short_window_count = (
-            db.query(Answer)
-            .join(Question, Answer.question_id == Question.id)
-            .filter(
-                Answer.user_id == user.id,
-                Question.kind == "daily",
-                Answer.created_at >= datetime.utcnow() - timedelta(minutes=10),
-            )
-            .count()
-        )
-        text_blob = " ".join(item.answer_text.strip() for item in payload.answers)
-        quality = assess_input_quality(text_blob, recent_texts, short_window_count)
         response.update({
-            "input_quality_score": quality["quality_score"],
-            "input_quality_flags": quality["flags"],
-            "is_low_quality": quality["is_low_quality"],
-            "reason_summary": quality["reason_summary"],
+            "input_quality_score": quality["quality_score"] if quality else None,
+            "input_quality_flags": quality["flags"] if quality else [],
+            "is_low_quality": quality["is_low_quality"] if quality else False,
+            "reason_summary": quality["reason_summary"] if quality else "Looks good.",
         })
     return response
 
@@ -1626,7 +1710,11 @@ def risk_latest(
     answers = (
         db.query(Answer, Question)
         .join(Question, Answer.question_id == Question.id)
-        .filter(Answer.user_id == user.id, Question.kind == "daily")
+        .filter(
+            Answer.user_id == user.id,
+            Question.kind == "daily",
+            Answer.is_low_quality.is_(False),
+        )
         .order_by(Answer.created_at.desc())
         .limit(10)
         .all()
@@ -1652,10 +1740,13 @@ def risk_latest(
 @app.get("/risk/history", response_model=List[RiskHistoryEntry])
 def risk_history(
     days: int = Query(30, ge=1, le=365),
+    include_low_quality: bool = Query(False),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> List[RiskHistoryEntry]:
     start_date = date.today() - timedelta(days=days - 1)
+    if include_low_quality and not is_dev_mode():
+        include_low_quality = False
 
     answers = (
         db.query(Answer, Question)
@@ -1665,6 +1756,7 @@ def risk_history(
             Question.kind == "daily",
             Answer.entry_date.isnot(None),
             Answer.entry_date >= start_date,
+            Answer.is_low_quality.is_(False) if not include_low_quality else True,
         )
         .order_by(Answer.entry_date.asc(), Answer.created_at.desc())
         .all()
@@ -1675,7 +1767,7 @@ def risk_history(
             JournalEntry.user_id == user.id,
             JournalEntry.entry_date.isnot(None),
             JournalEntry.entry_date >= start_date,
-            JournalEntry.is_low_quality.is_(False),
+            JournalEntry.is_low_quality.is_(False) if not include_low_quality else True,
         )
         .order_by(JournalEntry.entry_date.asc(), JournalEntry.created_at.desc())
         .all()
@@ -2022,10 +2114,13 @@ def rapid_submit(
 def rapid_history(
     days: int = Query(30, ge=1, le=365),
     include_invalid: bool = Query(False),
+    include_low_quality: bool = Query(False),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> List[RiskHistoryEntry]:
     start_date = date.today() - timedelta(days=days - 1)
+    if include_low_quality and not is_dev_mode():
+        include_low_quality = False
     query = (
         db.query(RapidEvaluation)
         .filter(
@@ -2033,6 +2128,7 @@ def rapid_history(
             RapidEvaluation.entry_date.isnot(None),
             RapidEvaluation.entry_date >= start_date,
             RapidEvaluation.submitted_at.isnot(None),
+            RapidEvaluation.is_low_quality.is_(False) if not include_low_quality else True,
         )
     )
     if not include_invalid:
@@ -2235,13 +2331,18 @@ def clear_demo_data(
 @app.get("/export/anonymized")
 def export_anonymized(
     days: int = Query(30, ge=1, le=365),
-    format: str = Query("zip", pattern="^(zip)$"),
+    format: str = Query("zip", pattern="^(zip|json)$"),
     include_journal_text: bool = Query(False),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> Response:
-    if format != "zip":
-        raise HTTPException(status_code=400, detail="Only zip format is supported.")
+    if format == "json":
+        export_payload = build_export_json(user, db, days, include_journal_text)
+        return Response(
+            content=json.dumps(export_payload, indent=2),
+            media_type="application/json",
+            headers={"Content-Disposition": "attachment; filename=mindtriage_export.json"},
+        )
 
     export_bytes = build_export_zip(user, db, days, include_journal_text)
     filename = f"mindtriage_export_{date.today().isoformat()}.zip"
@@ -2250,6 +2351,131 @@ def export_anonymized(
         media_type="application/zip",
         headers={"Content-Disposition": f"attachment; filename={filename}"},
     )
+
+
+@app.post("/import/anonymized")
+async def import_anonymized(
+    file: UploadFile = File(...),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    content = await file.read()
+    try:
+        payload = json.loads(content.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON file.") from exc
+
+    regular_rows = payload.get("regular_checkins", [])
+    rapid_rows = payload.get("rapid_evaluations", [])
+    journal_rows = payload.get("journals", [])
+
+    question_map = {
+        q.slug: q.id
+        for q in db.query(Question).all()
+    }
+    existing_answer_keys = {
+        (entry.entry_date.isoformat(), entry.question_id)
+        for entry in db.query(Answer)
+        .filter(Answer.user_id == user.id, Answer.entry_date.isnot(None))
+        .all()
+    }
+    existing_journal_dates = {
+        entry.entry_date.isoformat()
+        for entry in db.query(JournalEntry)
+        .filter(JournalEntry.user_id == user.id, JournalEntry.entry_date.isnot(None))
+        .all()
+    }
+    existing_rapid_dates = {
+        entry.entry_date.isoformat()
+        for entry in db.query(RapidEvaluation)
+        .filter(RapidEvaluation.user_id == user.id, RapidEvaluation.entry_date.isnot(None))
+        .all()
+    }
+
+    created = {"answers": 0, "journals": 0, "rapid_evaluations": 0}
+
+    for row in regular_rows:
+        entry_date = row.get("entry_date")
+        question_slug = row.get("question_slug")
+        if not entry_date or not question_slug:
+            continue
+        question_id = question_map.get(question_slug)
+        if not question_id:
+            continue
+        key = (entry_date, question_id)
+        if key in existing_answer_keys:
+            continue
+        try:
+            parsed_date = date.fromisoformat(entry_date)
+        except ValueError:
+            continue
+        created_at = parse_datetime_safe(row.get("created_at")) or datetime.utcnow()
+        answer = Answer(
+            user_id=user.id,
+            question_id=question_id,
+            answer_text=str(row.get("answer_text", "")).strip(),
+            entry_date=parsed_date,
+            created_at=created_at,
+        )
+        db.add(answer)
+        existing_answer_keys.add(key)
+        created["answers"] += 1
+
+    for row in journal_rows:
+        entry_date = row.get("entry_date")
+        text_value = row.get("text")
+        if not entry_date or not text_value:
+            continue
+        if entry_date in existing_journal_dates:
+            continue
+        try:
+            parsed_date = date.fromisoformat(entry_date)
+        except ValueError:
+            continue
+        created_at = parse_datetime_safe(row.get("created_at")) or datetime.utcnow()
+        entry = JournalEntry(
+            user_id=user.id,
+            content=str(text_value).strip(),
+            entry_date=parsed_date,
+            created_at=created_at,
+        )
+        db.add(entry)
+        existing_journal_dates.add(entry_date)
+        created["journals"] += 1
+
+    for row in rapid_rows:
+        entry_date = row.get("entry_date")
+        if not entry_date or entry_date in existing_rapid_dates:
+            continue
+        try:
+            parsed_date = date.fromisoformat(entry_date)
+        except ValueError:
+            continue
+        created_at = parse_datetime_safe(row.get("created_at")) or datetime.utcnow()
+        evaluation = RapidEvaluation(
+            user_id=user.id,
+            created_at=created_at,
+            entry_date=parsed_date,
+            started_at=None,
+            submitted_at=created_at,
+            answers_json="{}",
+            score=int(row.get("score", 0) or 0),
+            level=str(row.get("level", "GREEN")),
+            signals_json=str(row.get("signals", "[]")),
+            confidence_score=row.get("confidence_score"),
+            explainability_json=str(row.get("explanations", "[]")),
+            time_taken_seconds=row.get("time_taken_seconds"),
+            is_valid=bool(row.get("is_valid", True)),
+            quality_flags_json=str(row.get("quality_flags", "[]")),
+            is_low_quality=False,
+        )
+        db.add(evaluation)
+        existing_rapid_dates.add(entry_date)
+        created["rapid_evaluations"] += 1
+
+    db.commit()
+    update_user_baseline(user.id, db)
+    return {"created": created}
 
 
 @app.get("/export/anonymized/self_check")
@@ -2267,13 +2493,16 @@ def export_anonymized_self_check(
 @app.get("/metrics/summary")
 def metrics_summary(
     days: int = Query(30, ge=1, le=365),
+    include_low_quality: bool = Query(False),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
     start_date = date.today() - timedelta(days=days - 1)
-    regular_summary = build_regular_metrics(user.id, db, start_date, days)
-    rapid_summary = build_rapid_metrics(user.id, db, start_date)
-    safety_summary = build_safety_metrics(user.id, db, start_date)
+    if include_low_quality and not is_dev_mode():
+        include_low_quality = False
+    regular_summary = build_regular_metrics(user.id, db, start_date, days, include_low_quality)
+    rapid_summary = build_rapid_metrics(user.id, db, start_date, include_low_quality)
+    safety_summary = build_safety_metrics(user.id, db, start_date, include_low_quality)
     return {
         "regular": regular_summary,
         "rapid": rapid_summary,
@@ -2339,12 +2568,17 @@ def insights_today(
             Answer.user_id == user.id,
             Question.kind == "daily",
             Answer.entry_date == today,
+            Answer.is_low_quality.is_(False),
         )
         .all()
     )
     journal = (
         db.query(JournalEntry)
-        .filter(JournalEntry.user_id == user.id, JournalEntry.entry_date == today)
+        .filter(
+            JournalEntry.user_id == user.id,
+            JournalEntry.entry_date == today,
+            JournalEntry.is_low_quality.is_(False),
+        )
         .order_by(JournalEntry.created_at.desc())
         .first()
     )
@@ -2585,6 +2819,41 @@ def build_export_zip(
     return buffer.getvalue()
 
 
+def build_export_json(
+    user: User,
+    db: Session,
+    days: int,
+    include_journal_text: bool,
+) -> dict:
+    start_date = date.today() - timedelta(days=days - 1)
+    pseudonym = pseudonymize_user(user.id)
+
+    regular_rows = build_regular_checkins_rows(user.id, db, start_date, pseudonym)
+    rapid_rows = build_rapid_rows(user.id, db, start_date, pseudonym)
+    risk_rows = build_risk_history_rows(user.id, db, start_date, pseudonym)
+    journal_rows = build_journal_rows(user.id, db, start_date, pseudonym, include_journal_text)
+
+    schema = {
+        "regular_checkins": list(regular_rows[0].keys()) if regular_rows else [],
+        "rapid_evaluations": list(rapid_rows[0].keys()) if rapid_rows else [],
+        "risk_history": list(risk_rows[0].keys()) if risk_rows else [],
+        "journals": list(journal_rows[0].keys()) if journal_rows else [],
+    }
+
+    return {
+        "meta": {
+            "generated_at": datetime.utcnow().isoformat(),
+            "days": days,
+            "subject_id": pseudonym,
+        },
+        "regular_checkins": regular_rows,
+        "rapid_evaluations": rapid_rows,
+        "risk_history": risk_rows,
+        "journals": journal_rows,
+        "schema": schema,
+    }
+
+
 def rows_to_csv(rows: List[dict]) -> str:
     if not rows:
         return ""
@@ -2676,6 +2945,7 @@ def build_risk_history_rows(
             Question.kind == "daily",
             Answer.entry_date.isnot(None),
             Answer.entry_date >= start_date,
+            Answer.is_low_quality.is_(False),
         )
         .order_by(Answer.entry_date.asc(), Answer.created_at.desc())
         .all()
@@ -2686,6 +2956,7 @@ def build_risk_history_rows(
             JournalEntry.user_id == user_id,
             JournalEntry.entry_date.isnot(None),
             JournalEntry.entry_date >= start_date,
+            JournalEntry.is_low_quality.is_(False),
         )
         .order_by(JournalEntry.entry_date.asc(), JournalEntry.created_at.desc())
         .all()
@@ -2750,7 +3021,7 @@ def build_journal_rows(
     return rows
 
 
-def build_regular_metrics(user_id: int, db: Session, start_date: date, days: int) -> dict:
+def build_regular_metrics(user_id: int, db: Session, start_date: date, days: int, include_low_quality: bool) -> dict:
     daily_scores = []
     scores_by_day: dict[date, int] = {}
 
@@ -2762,6 +3033,7 @@ def build_regular_metrics(user_id: int, db: Session, start_date: date, days: int
             Question.kind == "daily",
             Answer.entry_date.isnot(None),
             Answer.entry_date >= start_date,
+            Answer.is_low_quality.is_(False) if not include_low_quality else True,
         )
         .order_by(Answer.entry_date.asc(), Answer.created_at.desc())
         .all()
@@ -2772,6 +3044,7 @@ def build_regular_metrics(user_id: int, db: Session, start_date: date, days: int
             JournalEntry.user_id == user_id,
             JournalEntry.entry_date.isnot(None),
             JournalEntry.entry_date >= start_date,
+            JournalEntry.is_low_quality.is_(False) if not include_low_quality else True,
         )
         .order_by(JournalEntry.entry_date.asc(), JournalEntry.created_at.desc())
         .all()
@@ -2813,7 +3086,7 @@ def build_regular_metrics(user_id: int, db: Session, start_date: date, days: int
     }
 
 
-def build_rapid_metrics(user_id: int, db: Session, start_date: date) -> dict:
+def build_rapid_metrics(user_id: int, db: Session, start_date: date, include_low_quality: bool) -> dict:
     evaluations = (
         db.query(RapidEvaluation)
         .filter(
@@ -2821,6 +3094,7 @@ def build_rapid_metrics(user_id: int, db: Session, start_date: date) -> dict:
             RapidEvaluation.entry_date.isnot(None),
             RapidEvaluation.entry_date >= start_date,
             RapidEvaluation.submitted_at.isnot(None),
+            RapidEvaluation.is_low_quality.is_(False) if not include_low_quality else True,
         )
         .order_by(RapidEvaluation.entry_date.asc(), RapidEvaluation.submitted_at.desc())
         .all()
@@ -2870,7 +3144,7 @@ def build_rapid_metrics(user_id: int, db: Session, start_date: date) -> dict:
     }
 
 
-def build_safety_metrics(user_id: int, db: Session, start_date: date) -> dict:
+def build_safety_metrics(user_id: int, db: Session, start_date: date, include_low_quality: bool) -> dict:
     evaluations = (
         db.query(RapidEvaluation)
         .filter(
@@ -2878,6 +3152,7 @@ def build_safety_metrics(user_id: int, db: Session, start_date: date) -> dict:
             RapidEvaluation.entry_date.isnot(None),
             RapidEvaluation.entry_date >= start_date,
             RapidEvaluation.submitted_at.isnot(None),
+            RapidEvaluation.is_low_quality.is_(False) if not include_low_quality else True,
         )
         .order_by(RapidEvaluation.entry_date.asc())
         .all()
@@ -2969,13 +3244,11 @@ def pick_micro_questions_for_date(user_id: int, entry_date: date, db: Session, k
     ]
 
 
-def fetch_micro_dates(user_id: int, db: Session) -> List[date]:
-    rows = (
-        db.query(MicroAnswer.entry_date)
-        .filter(MicroAnswer.user_id == user_id)
-        .distinct()
-        .all()
-    )
+def fetch_micro_dates(user_id: int, db: Session, include_low_quality: bool = False) -> List[date]:
+    query = db.query(MicroAnswer.entry_date).filter(MicroAnswer.user_id == user_id)
+    if not include_low_quality:
+        query = query.filter(MicroAnswer.is_low_quality.is_(False))
+    rows = query.distinct().all()
     return sorted({row[0] for row in rows if row[0]})
 
 
@@ -3017,18 +3290,20 @@ def compute_streak_from_latest(dates: List[date]) -> int:
     return streak
 
 
-def build_micro_signal(user_id: int, db: Session) -> dict:
+def build_micro_signal(user_id: int, db: Session, include_low_quality: bool = False) -> dict:
     today = date.today()
     start_date = today - timedelta(days=6)
-    count_last_7 = (
+    query = (
         db.query(MicroAnswer)
         .filter(
             MicroAnswer.user_id == user_id,
             MicroAnswer.entry_date >= start_date,
         )
-        .count()
     )
-    dates = fetch_micro_dates(user_id, db)
+    if not include_low_quality:
+        query = query.filter(MicroAnswer.is_low_quality.is_(False))
+    count_last_7 = query.count()
+    dates = fetch_micro_dates(user_id, db, include_low_quality=include_low_quality)
     streak_days = compute_current_streak(dates, today)
     confidence_bonus = 0.0
     if count_last_7 >= 5:
@@ -3200,6 +3475,71 @@ def assess_input_quality(text: str, recent_texts: List[str], short_window_count:
     }
 
 
+def assess_structured_quality(answers: List[str], recent_texts: List[str], short_window_count: int) -> dict:
+    flags: List[str] = []
+    cleaned_answers = [answer.strip() for answer in answers if answer is not None]
+    combined = " | ".join(cleaned_answers).strip()
+    lowered = combined.lower()
+    tokens = re.findall(r"\b\w+\b", lowered)
+
+    if not combined:
+        flags.append("too_short")
+    else:
+        is_numeric_only = all(item.isdigit() for item in cleaned_answers if item)
+        if len(combined) < 4 and not is_numeric_only:
+            flags.append("too_short")
+        if len(tokens) < 2 and not is_numeric_only:
+            flags.append("low_word_count")
+
+    if len(cleaned_answers) >= 2:
+        unique_answers = {item.lower() for item in cleaned_answers if item}
+        if len(unique_answers) == 1 and len(cleaned_answers[0]) >= 4:
+            flags.append("repeated_across_fields")
+
+    if re.search(r"(.)\1{4,}", lowered):
+        flags.append("repeated_characters")
+    if re.search(r"[bcdfghjklmnpqrstvwxyz]{5,}", lowered):
+        flags.append("keyboard_smash")
+    if tokens:
+        unique_ratio = len(set(tokens)) / len(tokens)
+        if unique_ratio < 0.4:
+            flags.append("repeated_tokens")
+
+    profanity = {"fuck", "shit", "bitch", "asshole", "damn", "cunt"}
+    if tokens and all(token in profanity for token in tokens):
+        flags.append("profanity_only")
+
+    normalized_recent = [item.strip().lower() for item in recent_texts]
+    if normalized_recent and lowered in normalized_recent:
+        flags.append("duplicate_recent")
+    if short_window_count >= 4:
+        flags.append("rapid_submissions")
+
+    score = 100
+    deductions = {
+        "too_short": 15,
+        "low_word_count": 15,
+        "repeated_characters": 10,
+        "repeated_tokens": 10,
+        "keyboard_smash": 10,
+        "profanity_only": 20,
+        "duplicate_recent": 25,
+        "rapid_submissions": 10,
+        "repeated_across_fields": 10,
+    }
+    for flag in flags:
+        score -= deductions.get(flag, 0)
+    score = max(0, min(100, score))
+    is_low_quality = score < 60
+    reason_summary = summarize_quality_flags(flags)
+    return {
+        "quality_score": score,
+        "flags": flags,
+        "is_low_quality": is_low_quality,
+        "reason_summary": reason_summary,
+    }
+
+
 def summarize_quality_flags(flags: List[str]) -> str:
     mapping = {
         "too_short": "Too short",
@@ -3210,6 +3550,7 @@ def summarize_quality_flags(flags: List[str]) -> str:
         "profanity_only": "Profanity only",
         "duplicate_recent": "Same as a recent entry",
         "rapid_submissions": "Many submissions in a short time",
+        "repeated_across_fields": "Same answer across fields",
     }
     if not flags:
         return "Looks good."
@@ -3223,6 +3564,18 @@ def calculate_retry_after(oldest_created_at: Optional[datetime], now: Optional[d
     now = now or datetime.utcnow()
     remaining = 3600 - (now - oldest_created_at).total_seconds()
     return max(60, int(remaining))
+
+
+def parse_datetime_safe(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo:
+        parsed = parsed.astimezone(tz=None).replace(tzinfo=None)
+    return parsed
 
 
 def update_user_baseline(user_id: int, db: Session, lookback_days: int = 30) -> Optional[UserBaseline]:
@@ -3277,6 +3630,7 @@ def update_user_baseline(user_id: int, db: Session, lookback_days: int = 30) -> 
             RapidEvaluation.entry_date >= start_date,
             RapidEvaluation.submitted_at.isnot(None),
             RapidEvaluation.is_valid.is_(True),
+            RapidEvaluation.is_low_quality.is_(False),
         )
         .all()
     ]
@@ -3307,6 +3661,7 @@ def update_user_baseline(user_id: int, db: Session, lookback_days: int = 30) -> 
             RapidEvaluation.entry_date >= start_date,
             RapidEvaluation.submitted_at.isnot(None),
             RapidEvaluation.is_valid.is_(True),
+            RapidEvaluation.is_low_quality.is_(False),
         )
         .all()
     )

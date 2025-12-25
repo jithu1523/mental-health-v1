@@ -15,6 +15,8 @@ if "token" not in st.session_state:
     st.session_state.token = None
 if "dev_mode" not in st.session_state:
     st.session_state.dev_mode = False
+if "backend_dev_mode" not in st.session_state:
+    st.session_state.backend_dev_mode = False
 if "daily_questions" not in st.session_state:
     st.session_state.daily_questions = None
 if "rapid_session_id" not in st.session_state:
@@ -49,6 +51,8 @@ if "eval_rapid_session_id" not in st.session_state:
     st.session_state.eval_rapid_session_id = None
 if "rapid_started_ts" not in st.session_state:
     st.session_state.rapid_started_ts = None
+if "include_low_quality" not in st.session_state:
+    st.session_state.include_low_quality = False
 
 
 def api_headers() -> dict:
@@ -108,20 +112,20 @@ def api_post(path: str, json=None, data=None):
 st.title("MindTriage")
 st.caption("Not a diagnosis. If you feel unsafe contact local emergency services.")
 
-checkin_tab_label = "Check-in & Journal"
-history_tab_label = "Journal History"
+home_tab_label = "Home"
+micro_tab_label = "Quick Check-in"
+daily_tab_label = "Daily Check-in"
+journal_tab_label = "Journal"
 insights_tab_label = "Insights"
-rapid_tab_label = "Rapid Evaluation"
-metrics_tab_label = "Methods + Metrics"
-account_tab_label = "Account"
-checkin_tab, history_tab, insights_tab, rapid_tab, metrics_tab, account_tab = st.tabs(
+export_tab_label = "Export"
+home_tab, micro_tab, daily_tab, journal_tab, insights_tab, export_tab = st.tabs(
     [
-        checkin_tab_label,
-        history_tab_label,
+        home_tab_label,
+        micro_tab_label,
+        daily_tab_label,
+        journal_tab_label,
         insights_tab_label,
-        rapid_tab_label,
-        metrics_tab_label,
-        account_tab_label,
+        export_tab_label,
     ]
 )
 
@@ -130,11 +134,7 @@ health_resp = api_get("/health")
 if health_resp is None:
     st.error("Backend check failed. Start backend with: uvicorn app.main:app --reload --port 8000")
 elif health_resp.ok:
-    payload = safe_json(health_resp) or {}
-    st.session_state.dev_mode = bool(payload.get("dev_mode"))
     message = f"Backend healthy ({health_resp.status_code}) | {api_url('/health')}"
-    if st.session_state.dev_mode:
-        message += " | Dev mode enabled"
     st.success(message)
 else:
     snippet = (health_resp.text or "").strip()
@@ -144,67 +144,139 @@ else:
     )
     st.error("Start backend with: uvicorn app.main:app --reload --port 8000")
 
-dev_ui_enabled = os.getenv("DEV_MODE", "").strip().lower() in {"1", "true", "yes", "on"}
+meta_resp = api_get("/meta")
+if meta_resp is not None and meta_resp.ok:
+    meta_payload = safe_json(meta_resp) or {}
+    st.session_state.backend_dev_mode = bool(meta_payload.get("dev_mode"))
+else:
+    st.session_state.backend_dev_mode = False
+
+def get_query_param(key: str) -> str:
+    try:
+        params = st.query_params
+    except Exception:
+        params = st.experimental_get_query_params()
+    value = params.get(key)
+    if isinstance(value, list):
+        return value[0] if value else ""
+    return value or ""
+
+dev_ui_enabled = False
+local_dev_env = os.getenv("DEV_MODE", "").strip().lower() in {"1", "true", "yes", "on"}
+dev_requested = get_query_param("dev") == "1"
+if st.session_state.backend_dev_mode and local_dev_env and dev_requested:
+    dev_ui_enabled = True
+
 if "ui_dev_mode" not in st.session_state:
     st.session_state.ui_dev_mode = False
 if "show_quality_details" not in st.session_state:
     st.session_state.show_quality_details = False
 if dev_ui_enabled:
     st.sidebar.subheader("Developer Mode")
-    if st.session_state.dev_mode:
-        st.session_state.ui_dev_mode = st.sidebar.checkbox(
-            "Enable developer controls",
-            value=st.session_state.ui_dev_mode,
-        )
-        st.session_state.show_quality_details = st.sidebar.checkbox(
-            "Show quality details",
-            value=st.session_state.show_quality_details,
-        )
-    else:
-        st.session_state.ui_dev_mode = False
-        st.sidebar.info("Enable DEV_MODE in backend to unlock developer controls.")
+    st.session_state.ui_dev_mode = st.sidebar.checkbox(
+        "Enable developer controls",
+        value=st.session_state.ui_dev_mode,
+    )
+    st.session_state.show_quality_details = st.sidebar.checkbox(
+        "Show quality details",
+        value=st.session_state.show_quality_details,
+    )
+    st.session_state.include_low_quality = st.sidebar.checkbox(
+        "Include low-quality items in insights",
+        value=st.session_state.include_low_quality,
+    )
 else:
     st.session_state.ui_dev_mode = False
+    st.session_state.show_quality_details = False
+    st.session_state.include_low_quality = False
 
-with account_tab:
-    st.subheader("Sign up")
-    with st.form("register_form"):
-        reg_email = st.text_input("Email", key="reg_email")
-        reg_password = st.text_input("Password", type="password", key="reg_password")
-        if st.form_submit_button("Create account"):
-            if not reg_email or not reg_password:
-                st.warning("Enter an email and password.")
+with home_tab:
+    st.subheader("Today")
+    if not st.session_state.token:
+        st.warning("Sign in to continue.")
+    else:
+        risk_resp = api_get("/risk/latest")
+        risk_level = "unknown"
+        if risk_resp is not None and risk_resp.ok:
+            risk = safe_json(risk_resp) or {}
+            risk_level = risk.get("risk_level", "unknown")
+            st.metric("Current risk level", risk_level)
+        elif risk_resp is not None:
+            show_response_error(risk_resp, "/risk/latest", "Unable to load risk status.")
+
+        history_params = "?days=30"
+        if st.session_state.ui_dev_mode and st.session_state.include_low_quality:
+            history_params += "&include_low_quality=true"
+        history_resp = api_get(f"/risk/history{history_params}")
+        last_checkin = "No check-ins yet."
+        if history_resp is not None and history_resp.ok:
+            history = safe_json(history_resp) or []
+            if history:
+                last_checkin = history[-1].get("date", last_checkin)
+        elif history_resp is not None:
+            show_response_error(history_resp, "/risk/history", "Unable to load check-in history.")
+        st.write(f"Last check-in: {last_checkin}")
+
+        streak_params = "?include_low_quality=true" if st.session_state.include_low_quality else ""
+        streak_resp = api_get(f"/micro/streak{streak_params}")
+        if streak_resp is not None and streak_resp.ok:
+            streak = safe_json(streak_resp) or {}
+            st.session_state.micro_streak_days = streak.get("streak_days", 0)
+            st.write(f"Micro streak: {st.session_state.micro_streak_days} days")
+        elif streak_resp is not None:
+            show_response_error(streak_resp, "/micro/streak", "Unable to load micro streak.")
+
+        st.subheader("Quick note")
+        quick_note = st.text_area("What's one thing you want to note today?", height=100)
+        if st.button("Save note to journal"):
+            if not quick_note.strip():
+                st.warning("Add a short note before saving.")
             else:
-                resp = api_post("/auth/register", json={"email": reg_email, "password": reg_password})
+                resp = api_post("/journal", json={"content": quick_note})
                 if resp is not None and resp.ok:
-                    payload = safe_json(resp) or {}
-                    token = payload.get("access_token")
-                    st.session_state.token = token
-                    st.success("Account created. You are signed in.")
+                    st.success("Note saved.")
                 elif resp is not None:
-                    show_response_error(resp, "/auth/register", "Registration failed.")
+                    show_response_error(resp, "/journal", "Unable to save note.")
 
-    st.subheader("Login")
-    with st.form("login_form"):
-        login_email = st.text_input("Email", key="login_email")
-        login_password = st.text_input("Password", type="password", key="login_password")
-        if st.form_submit_button("Sign in"):
-            if not login_email or not login_password:
-                st.warning("Enter your email and password.")
-            else:
-                resp = api_post(
-                    "/auth/login",
-                    data={"username": login_email, "password": login_password},
-                )
-                if resp is not None and resp.ok:
-                    payload = safe_json(resp) or {}
-                    token = payload.get("access_token")
-                    st.session_state.token = token
-                    st.success("Signed in.")
-                elif resp is not None:
-                    show_response_error(resp, "/auth/login", "Login failed.")
+    st.subheader("Account")
+    if not st.session_state.token:
+        st.subheader("Sign up")
+        with st.form("register_form"):
+            reg_email = st.text_input("Email", key="reg_email")
+            reg_password = st.text_input("Password", type="password", key="reg_password")
+            if st.form_submit_button("Create account"):
+                if not reg_email or not reg_password:
+                    st.warning("Enter an email and password.")
+                else:
+                    resp = api_post("/auth/register", json={"email": reg_email, "password": reg_password})
+                    if resp is not None and resp.ok:
+                        payload = safe_json(resp) or {}
+                        token = payload.get("access_token")
+                        st.session_state.token = token
+                        st.success("Account created. You are signed in.")
+                    elif resp is not None:
+                        show_response_error(resp, "/auth/register", "Registration failed.")
 
-    if st.session_state.token:
+        st.subheader("Login")
+        with st.form("login_form"):
+            login_email = st.text_input("Email", key="login_email")
+            login_password = st.text_input("Password", type="password", key="login_password")
+            if st.form_submit_button("Sign in"):
+                if not login_email or not login_password:
+                    st.warning("Enter your email and password.")
+                else:
+                    resp = api_post(
+                        "/auth/login",
+                        data={"username": login_email, "password": login_password},
+                    )
+                    if resp is not None and resp.ok:
+                        payload = safe_json(resp) or {}
+                        token = payload.get("access_token")
+                        st.session_state.token = token
+                        st.success("Signed in.")
+                    elif resp is not None:
+                        show_response_error(resp, "/auth/login", "Login failed.")
+    else:
         st.info("Authenticated.")
         if st.button("Logout"):
             st.session_state.token = None
@@ -285,9 +357,127 @@ with account_tab:
                 elif profile_resp is not None:
                     show_response_error(profile_resp, "/onboarding/questions", "Unable to load mini-profile.")
 
-with checkin_tab:
+with micro_tab:
     if not st.session_state.token:
-        st.warning("Sign in on the Account tab to continue.")
+        st.warning("Sign in on the Home tab to continue.")
+    else:
+        st.subheader("Quick check-in (10 seconds)")
+        override_micro_date = None
+        if st.session_state.ui_dev_mode:
+            st.caption("Developer Mode: date/time overrides enabled.")
+            if st.checkbox("Override date (Quick check-in)", key="override_micro_dt"):
+                override_micro_date = st.date_input(
+                    "Micro override date",
+                    value=date.today(),
+                    key="micro_override_date",
+                )
+        micro_status_date = override_micro_date or date.today()
+        status_resp = api_get(f"/micro/status?entry_date={micro_status_date.isoformat()}")
+        done_for_date = False
+        if status_resp is not None and status_resp.ok:
+            status_payload = safe_json(status_resp) or {}
+            done_for_date = bool(status_payload.get("done"))
+        elif status_resp is not None:
+            show_response_error(status_resp, "/micro/status", "Unable to load micro status.")
+
+        micro_resp = api_get(f"/micro/questions?entry_date={micro_status_date.isoformat()}&k=2")
+        if micro_resp is not None and micro_resp.ok:
+            micro = safe_json(micro_resp) or {}
+            questions = micro.get("questions", [])
+            if not questions:
+                st.info("No micro check-in available.")
+            elif done_for_date:
+                label = "Done for selected date" if override_micro_date else "Done for today"
+                st.success(label)
+            else:
+                with st.form("micro_form"):
+                    micro_payloads = []
+                    for idx, question in enumerate(questions):
+                        prompt = question.get("prompt", "Quick check-in")
+                        qtype = question.get("question_type")
+                        options = question.get("options", [])
+                        if qtype == "scale":
+                            value = st.slider(prompt, 1, 5, 3, key=f"micro_scale_{idx}")
+                            answer_value = str(value)
+                        else:
+                            answer_value = st.selectbox(prompt, options, key=f"micro_choice_{idx}")
+                        micro_payloads.append({
+                            "question_id": question.get("id"),
+                            "value": answer_value,
+                        })
+                    if st.form_submit_button("Save micro answers"):
+                        saved = 0
+                        reason_summaries = []
+                        for payload in micro_payloads:
+                            if override_micro_date:
+                                payload["override_entry_date"] = override_micro_date.isoformat()
+                            resp = api_post("/micro/answers", json=payload)
+                            if resp is not None and resp.ok:
+                                saved += 1
+                                resp_payload = safe_json(resp) or {}
+                                if resp_payload.get("is_low_quality"):
+                                    reason_summaries.append(resp_payload.get("reason_summary"))
+                            elif resp is not None:
+                                show_response_error(resp, "/micro/answers", "Unable to save quick check-in.")
+                                break
+                        if saved == len(micro_payloads):
+                            if reason_summaries:
+                                reason_text = "; ".join(filter(None, reason_summaries)) or "Too brief."
+                                st.warning(f"Low quality: {reason_text}. Try adding 1-2 sentences.")
+                            else:
+                                st.success("Quick check-in saved.")
+                            status_resp = api_get(f"/micro/status?entry_date={micro_status_date.isoformat()}")
+                            if status_resp is not None and status_resp.ok:
+                                status_payload = safe_json(status_resp) or {}
+                                done_for_date = bool(status_payload.get("done"))
+                            streak_query = "?include_low_quality=true" if st.session_state.include_low_quality else ""
+                            streak_resp = api_get(f"/micro/streak{streak_query}")
+                            if streak_resp is not None and streak_resp.ok:
+                                streak_payload = safe_json(streak_resp) or {}
+                                st.session_state.micro_streak_days = streak_payload.get("streak_days", 0)
+        elif micro_resp is not None:
+            show_response_error(micro_resp, "/micro/questions", "Unable to load quick check-in.")
+
+        streak_query = "?include_low_quality=true" if st.session_state.include_low_quality else ""
+        streak_resp = api_get(f"/micro/streak{streak_query}")
+        if streak_resp is not None and streak_resp.ok:
+            streak = safe_json(streak_resp) or {}
+            st.session_state.micro_streak_days = streak.get("streak_days", 0)
+            st.write(f"Micro streak: {st.session_state.micro_streak_days} days")
+        elif streak_resp is not None:
+            show_response_error(streak_resp, "/micro/streak", "Unable to load micro streak.")
+
+        history_query = "days=7"
+        if st.session_state.ui_dev_mode and st.session_state.include_low_quality:
+            history_query += "&include_low_quality=true"
+        history_resp = api_get(f"/micro/history?{history_query}")
+        if history_resp is not None and history_resp.ok:
+            history = safe_json(history_resp) or []
+            st.session_state.micro_answered_last_7 = len(history)
+            if history:
+                st.caption("Last 7 days")
+                st.table(history)
+            else:
+                st.info("No quick check-ins yet.")
+        elif history_resp is not None:
+            show_response_error(history_resp, "/micro/history", "Unable to load quick check-in history.")
+
+        if st.session_state.ui_dev_mode:
+            debug_resp = api_get("/dev/debug/micro")
+            if debug_resp is not None and debug_resp.ok:
+                debug_data = safe_json(debug_resp) or {}
+                st.caption("Dev debug")
+                st.write(f"Total micro answers: {debug_data.get('count_micro_answers_total', 0)}")
+                last_items = debug_data.get("last_5_micro_answers", [])
+                if last_items:
+                    st.write(f"Last entry date: {last_items[0].get('entry_date')}")
+            elif debug_resp is not None:
+                show_response_error(debug_resp, "/dev/debug/micro", "Unable to load micro debug data.")
+
+        st.caption("Not a diagnosis. If you feel unsafe contact local emergency services.")
+with daily_tab:
+    if not st.session_state.token:
+        st.warning("Sign in on the Home tab to continue.")
     else:
         status_resp = api_get("/onboarding/status")
         if status_resp is None:
@@ -297,10 +487,8 @@ with checkin_tab:
             st.stop()
 
         status = status_resp.json()
-        missing_ids = status.get("missing_question_ids", [])
-
         if not status.get("complete"):
-            st.info("Complete onboarding in the Account tab to unlock check-ins.")
+            st.info("Complete onboarding in the Home tab to unlock check-ins.")
             st.stop()
 
         st.subheader("Daily check-in")
@@ -350,14 +538,15 @@ with checkin_tab:
                         payload = safe_json(resp) or {}
                         if payload.get("is_low_quality"):
                             st.warning(f"Low quality: {payload.get('reason_summary', '')}. Try adding 1-2 sentences.")
+                            st.info("You can edit your answers and resubmit.")
                         else:
                             st.success("Daily check-in saved.")
+                            st.session_state.daily_questions = None
                         if st.session_state.show_quality_details:
                             st.caption(
                                 f"Quality score: {payload.get('input_quality_score')} | "
                                 f"Flags: {payload.get('input_quality_flags')}"
                             )
-                        st.session_state.daily_questions = None
                         st.session_state.micro_signal = payload.get("micro_signal")
                         eval_payload = {
                             "daily_answers": daily_answer_map,
@@ -372,179 +561,6 @@ with checkin_tab:
                             show_response_error(eval_resp, "/evaluate", "Unable to run evaluation.")
                     elif resp is not None:
                         st.error(resp.json().get("detail", "Unable to save daily answers."))
-
-        st.subheader("Quick check-in (10 seconds)")
-        override_micro_date = None
-        if st.session_state.ui_dev_mode:
-            if st.checkbox("Override date (Quick check-in)", key="override_micro_dt"):
-                override_micro_date = st.date_input(
-                    "Micro override date",
-                    value=date.today(),
-                    key="micro_override_date",
-                )
-        micro_status_date = override_micro_date or date.today()
-        status_resp = api_get(f"/micro/status?entry_date={micro_status_date.isoformat()}")
-        done_for_date = False
-        if status_resp is not None and status_resp.ok:
-            status_payload = safe_json(status_resp) or {}
-            done_for_date = bool(status_payload.get("done"))
-        elif status_resp is not None:
-            show_response_error(status_resp, "/micro/status", "Unable to load micro status.")
-
-        micro_resp = api_get(f"/micro/questions?entry_date={micro_status_date.isoformat()}&k=2")
-        if micro_resp is not None and micro_resp.ok:
-            micro = safe_json(micro_resp) or {}
-            questions = micro.get("questions", [])
-            if not questions:
-                st.info("No micro check-in available.")
-            elif done_for_date:
-                label = "Done for selected date ✅" if override_micro_date else "Done for today ✅"
-                st.success(label)
-            else:
-                with st.form("micro_form"):
-                    micro_payloads = []
-                    for idx, question in enumerate(questions):
-                        prompt = question.get("prompt", "Quick check-in")
-                        qtype = question.get("question_type")
-                        options = question.get("options", [])
-                        if qtype == "scale":
-                            value = st.slider(prompt, 1, 5, 3, key=f"micro_scale_{idx}")
-                            answer_value = str(value)
-                        else:
-                            answer_value = st.selectbox(prompt, options, key=f"micro_choice_{idx}")
-                        micro_payloads.append({
-                            "question_id": question.get("id"),
-                            "value": answer_value,
-                        })
-                    if st.form_submit_button("Save micro answers"):
-                        saved = 0
-                        for payload in micro_payloads:
-                            if override_micro_date:
-                                payload["override_entry_date"] = override_micro_date.isoformat()
-                            resp = api_post("/micro/answers", json=payload)
-                            if resp is not None and resp.ok:
-                                saved += 1
-                            elif resp is not None:
-                                show_response_error(resp, "/micro/answers", "Unable to save quick check-in.")
-                                break
-                        if saved == len(micro_payloads):
-                            st.success("Quick check-in saved.")
-                            status_resp = api_get(f"/micro/status?entry_date={micro_status_date.isoformat()}")
-                            if status_resp is not None and status_resp.ok:
-                                status_payload = safe_json(status_resp) or {}
-                                done_for_date = bool(status_payload.get("done"))
-                            streak_resp = api_get("/micro/streak")
-                            if streak_resp is not None and streak_resp.ok:
-                                streak_payload = safe_json(streak_resp) or {}
-                                st.session_state.micro_streak_days = streak_payload.get("streak_days", 0)
-        elif micro_resp is not None:
-            show_response_error(micro_resp, "/micro/questions", "Unable to load quick check-in.")
-
-        streak_resp = api_get("/micro/streak")
-        if streak_resp is not None and streak_resp.ok:
-            streak = safe_json(streak_resp) or {}
-            st.session_state.micro_streak_days = streak.get("streak_days", 0)
-            st.write(f"Micro streak: {st.session_state.micro_streak_days} days")
-        elif streak_resp is not None:
-            show_response_error(streak_resp, "/micro/streak", "Unable to load micro streak.")
-
-        history_resp = api_get("/micro/history?days=7")
-        if history_resp is not None and history_resp.ok:
-            history = safe_json(history_resp) or []
-            st.session_state.micro_answered_last_7 = len(history)
-            if history:
-                st.caption("Last 7 days")
-                st.table(history)
-            else:
-                st.info("No quick check-ins yet.")
-        elif history_resp is not None:
-            show_response_error(history_resp, "/micro/history", "Unable to load quick check-in history.")
-
-        if st.session_state.ui_dev_mode:
-            debug_resp = api_get("/dev/debug/micro")
-            if debug_resp is not None and debug_resp.ok:
-                debug_data = safe_json(debug_resp) or {}
-                st.caption("Dev debug")
-                st.write(f"Total micro answers: {debug_data.get('count_micro_answers_total', 0)}")
-                last_items = debug_data.get("last_5_micro_answers", [])
-                if last_items:
-                    st.write(f"Last entry date: {last_items[0].get('entry_date')}")
-            elif debug_resp is not None:
-                show_response_error(debug_resp, "/dev/debug/micro", "Unable to load micro debug data.")
-
-        st.subheader("Journal")
-        selected_journal_date = date.today()
-        override_journal_dt = None
-        if st.session_state.ui_dev_mode:
-            st.caption("Developer Mode: date/time overrides enabled.")
-            if st.checkbox("Override date/time (Journal)", key="override_journal_dt"):
-                override_date = st.date_input("Journal override date", value=date.today(), key="journal_date")
-                override_time = st.time_input("Journal override time", value=datetime.now().time(), key="journal_time")
-                override_journal_dt = datetime.combine(override_date, override_time)
-                selected_journal_date = override_date
-        journal_text = st.text_area("Write a short entry", height=140)
-        if st.button("Save journal entry"):
-            if not journal_text.strip():
-                st.warning("Write something before saving.")
-            else:
-                payload = {
-                    "content": journal_text,
-                    "entry_date": selected_journal_date.isoformat(),
-                }
-                if override_journal_dt:
-                    payload["override_datetime"] = override_journal_dt.isoformat()
-                resp = api_post("/journal", json=payload)
-                if resp is not None and resp.ok:
-                    payload = safe_json(resp) or {}
-                    if payload.get("is_low_quality"):
-                        st.warning(f"Low quality: {payload.get('reason_summary', '')}. Try adding 1-2 sentences.")
-                    else:
-                        st.success("Journal entry saved.")
-                    if st.session_state.show_quality_details:
-                        st.caption(
-                            f"Quality score: {payload.get('input_quality_score')} | "
-                            f"Flags: {payload.get('input_quality_flags')}"
-                        )
-                elif resp is not None:
-                    if resp.status_code == 429:
-                        retry_after = resp.headers.get("Retry-After")
-                        detail = (safe_json(resp) or {}).get("detail", resp.text)
-                        if retry_after:
-                            st.warning(f"{detail} Retry after {retry_after} seconds.")
-                        else:
-                            st.warning(detail)
-                    else:
-                        show_response_error(resp, "/journal", "Unable to save journal.")
-
-        if st.session_state.ui_dev_mode:
-            st.subheader("Developer Tools")
-            if st.button("Seed demo data (14 days)"):
-                resp = api_post("/dev/seed_demo")
-                if resp is not None and resp.ok:
-                    payload = safe_json(resp) or {}
-                    created = payload.get("created", {})
-                    st.success(
-                        "Demo data created: "
-                        f"{created.get('answers', 0)} answers, "
-                        f"{created.get('journals', 0)} journals, "
-                        f"{created.get('rapid_evaluations', 0)} rapid evaluations."
-                    )
-                    st.markdown("[Go to Risk Trend](#risk-trend)")
-                elif resp is not None:
-                    show_response_error(resp, "/dev/seed_demo", "Unable to seed demo data.")
-            if st.button("Clear demo data"):
-                resp = api_post("/dev/clear_demo")
-                if resp is not None and resp.ok:
-                    payload = safe_json(resp) or {}
-                    deleted = payload.get("deleted", {})
-                    st.success(
-                        "Demo data cleared: "
-                        f"{deleted.get('answers', 0)} answers, "
-                        f"{deleted.get('journals', 0)} journals, "
-                        f"{deleted.get('rapid_evaluations', 0)} rapid evaluations."
-                    )
-                elif resp is not None:
-                    show_response_error(resp, "/dev/clear_demo", "Unable to clear demo data.")
 
         if st.session_state.eval_daily_followups:
             st.subheader("Quick follow-up")
@@ -582,14 +598,9 @@ with checkin_tab:
                     f"Flags: {quality.get('flags')}"
                 )
 
+        st.divider()
+        st.subheader("Rapid Evaluation")
         st.caption("Not a diagnosis. If you feel unsafe contact local emergency services.")
-
-with rapid_tab:
-    st.subheader("Rapid Evaluation")
-    st.caption("Not a diagnosis. If you feel unsafe contact local emergency services.")
-    if not st.session_state.token:
-        st.warning("Sign in on the Account tab to continue.")
-    else:
         rapid_date = date.today()
         override_rapid_dt = None
         if st.session_state.ui_dev_mode:
@@ -804,7 +815,10 @@ with rapid_tab:
                     st.write(f"- {item}")
 
         st.subheader("Recent rapid evaluations")
-        history_resp = api_get("/rapid/history")
+        history_params = "?days=30"
+        if st.session_state.ui_dev_mode and st.session_state.include_low_quality:
+            history_params += "&include_low_quality=true"
+        history_resp = api_get(f"/rapid/history{history_params}")
         if history_resp is not None and history_resp.ok:
             history = safe_json(history_resp) or []
             if history:
@@ -816,12 +830,58 @@ with rapid_tab:
         elif history_resp is not None:
             show_response_error(history_resp, "/rapid/history", "Unable to load rapid history.")
 
-with history_tab:
-    st.subheader("Journal History")
+        st.caption("Not a diagnosis. If you feel unsafe contact local emergency services.")
+with journal_tab:
+    st.subheader("Journal")
     st.caption("Not a diagnosis. If you feel unsafe contact local emergency services.")
     if not st.session_state.token:
-        st.warning("Sign in on the Account tab to continue.")
+        st.warning("Sign in on the Home tab to continue.")
     else:
+        selected_journal_date = date.today()
+        override_journal_dt = None
+        if st.session_state.ui_dev_mode:
+            st.caption("Developer Mode: date/time overrides enabled.")
+            if st.checkbox("Override date/time (Journal)", key="override_journal_dt"):
+                override_date = st.date_input("Journal override date", value=date.today(), key="journal_date")
+                override_time = st.time_input("Journal override time", value=datetime.now().time(), key="journal_time")
+                override_journal_dt = datetime.combine(override_date, override_time)
+                selected_journal_date = override_date
+        journal_text = st.text_area("Write a short entry", height=140)
+        if st.button("Save journal entry"):
+            if not journal_text.strip():
+                st.warning("Write something before saving.")
+            else:
+                payload = {
+                    "content": journal_text,
+                    "entry_date": selected_journal_date.isoformat(),
+                }
+                if override_journal_dt:
+                    payload["override_datetime"] = override_journal_dt.isoformat()
+                resp = api_post("/journal", json=payload)
+                if resp is not None and resp.ok:
+                    payload = safe_json(resp) or {}
+                    if payload.get("is_low_quality"):
+                        st.warning(f"Low quality: {payload.get('reason_summary', '')}. Try adding 1-2 sentences.")
+                        st.info("You can edit and resubmit if you'd like.")
+                    else:
+                        st.success("Journal entry saved.")
+                    if st.session_state.show_quality_details:
+                        st.caption(
+                            f"Quality score: {payload.get('input_quality_score')} | "
+                            f"Flags: {payload.get('input_quality_flags')}"
+                        )
+                elif resp is not None:
+                    if resp.status_code == 429:
+                        retry_after = resp.headers.get("Retry-After")
+                        detail = (safe_json(resp) or {}).get("detail", resp.text)
+                        if retry_after:
+                            st.warning(f"{detail} Retry after {retry_after} seconds.")
+                        else:
+                            st.warning(detail)
+                    else:
+                        show_response_error(resp, "/journal", "Unable to save journal.")
+
+        st.subheader("Journal History")
         days = st.selectbox("Show last", [7, 30, 90], index=1, key="journal_days")
         search = st.text_input("Search journal text", value="", key="journal_search")
 
@@ -836,7 +896,8 @@ with history_tab:
             if entries:
                 for entry in entries:
                     preview = entry.get("content", "")[:120]
-                    with st.expander(f"{entry.get('created_at')} — {preview}"):
+                    header = f"{entry.get('created_at', '')} | {preview}"
+                    with st.expander(header):
                         st.write(entry.get("content"))
                         if st.session_state.ui_dev_mode:
                             flags = entry.get("input_quality_flags") or []
@@ -849,15 +910,50 @@ with history_tab:
         elif journal_resp is not None:
             show_response_error(journal_resp, "/journal", "Unable to load journal history.")
 
-        st.subheader("Export")
+        if st.session_state.ui_dev_mode:
+            st.subheader("Developer Tools")
+            if st.button("Seed demo data (14 days)"):
+                resp = api_post("/dev/seed_demo")
+                if resp is not None and resp.ok:
+                    payload = safe_json(resp) or {}
+                    created = payload.get("created", {})
+                    st.success(
+                        "Demo data created: "
+                        f"{created.get('answers', 0)} answers, "
+                        f"{created.get('journals', 0)} journals, "
+                        f"{created.get('rapid_evaluations', 0)} rapid evaluations."
+                    )
+                elif resp is not None:
+                    show_response_error(resp, "/dev/seed_demo", "Unable to seed demo data.")
+            if st.button("Clear demo data"):
+                resp = api_post("/dev/clear_demo")
+                if resp is not None and resp.ok:
+                    payload = safe_json(resp) or {}
+                    deleted = payload.get("deleted", {})
+                    st.success(
+                        "Demo data cleared: "
+                        f"{deleted.get('answers', 0)} answers, "
+                        f"{deleted.get('journals', 0)} journals, "
+                        f"{deleted.get('rapid_evaluations', 0)} rapid evaluations."
+                    )
+                elif resp is not None:
+                    show_response_error(resp, "/dev/clear_demo", "Unable to clear demo data.")
+with export_tab:
+    st.subheader("Export")
+    st.caption("Not a diagnosis. If you feel unsafe contact local emergency services.")
+    if not st.session_state.token:
+        st.warning("Sign in on the Home tab to continue.")
+    else:
+        days = st.selectbox("Export range", [7, 30, 90], index=1, key="export_days")
         include_text = st.checkbox("Include journal text", value=False)
+        export_format = st.selectbox("Export format", ["zip", "json"], index=0)
         st.warning("Never share exports containing journal text publicly.")
-        if st.button("Download Anonymized Export"):
+        if st.button("Download my data"):
             try:
                 resp = requests.get(
                     api_url("/export/anonymized"),
                     headers=api_headers(),
-                    params={"days": days, "format": "zip", "include_journal_text": include_text},
+                    params={"days": days, "format": export_format, "include_journal_text": include_text},
                     timeout=30,
                 )
             except requests.RequestException as exc:
@@ -871,18 +967,46 @@ with history_tab:
 
         export_bytes = st.session_state.get("export_bytes")
         if export_bytes:
+            file_name = "mindtriage_export.zip" if export_format == "zip" else "mindtriage_export.json"
+            mime = "application/zip" if export_format == "zip" else "application/json"
             st.download_button(
-                "Download export zip",
+                "Download export",
                 data=export_bytes,
-                file_name="mindtriage_export.zip",
-                mime="application/zip",
+                file_name=file_name,
+                mime=mime,
             )
 
+        st.subheader("Import")
+        st.caption("Import a JSON export into this local database.")
+        upload = st.file_uploader("Import my data (JSON)", type=["json"])
+        if upload is not None:
+            files = {"file": (upload.name, upload.getvalue(), "application/json")}
+            try:
+                resp = requests.post(
+                    api_url("/import/anonymized"),
+                    headers=api_headers(),
+                    files=files,
+                    timeout=30,
+                )
+            except requests.RequestException as exc:
+                st.error(f"Request failed: {exc}")
+                resp = None
+            if resp is not None and resp.ok:
+                payload = safe_json(resp) or {}
+                created = payload.get("created", {})
+                st.success(
+                    "Import complete: "
+                    f"{created.get('answers', 0)} answers, "
+                    f"{created.get('journals', 0)} journals, "
+                    f"{created.get('rapid_evaluations', 0)} rapid evaluations."
+                )
+            elif resp is not None:
+                show_response_error(resp, "/import/anonymized", "Import failed.")
 with insights_tab:
     st.subheader("Insights")
     st.caption("Not a diagnosis. If you feel unsafe contact local emergency services.")
     if not st.session_state.token:
-        st.warning("Sign in on the Account tab to continue.")
+        st.warning("Sign in on the Home tab to continue.")
     else:
         st.subheader("Triage Summary")
         risk_level = None
@@ -939,9 +1063,22 @@ with insights_tab:
         else:
             st.info("Complete a daily check-in to generate an action plan.")
 
+        st.subheader("Streaks")
+        streak_query = "?include_low_quality=true" if st.session_state.include_low_quality else ""
+        streak_resp = api_get(f"/micro/streak{streak_query}")
+        if streak_resp is not None and streak_resp.ok:
+            streak = safe_json(streak_resp) or {}
+            st.session_state.micro_streak_days = streak.get("streak_days", 0)
+            st.write(f"Micro streak: {st.session_state.micro_streak_days} days")
+        elif streak_resp is not None:
+            show_response_error(streak_resp, "/micro/streak", "Unable to load micro streak.")
+
         st.markdown("<a name='risk-trend'></a>", unsafe_allow_html=True)
         st.subheader("Risk Trend")
-        history_resp = api_get("/risk/history")
+        history_path = "/risk/history"
+        if st.session_state.ui_dev_mode and st.session_state.include_low_quality:
+            history_path = "/risk/history?include_low_quality=true"
+        history_resp = api_get(history_path)
         if history_resp is not None and history_resp.ok:
             history = safe_json(history_resp) or []
             if len(history) == 0:
@@ -1007,82 +1144,79 @@ with insights_tab:
         elif insights_resp is not None:
             show_response_error(insights_resp, "/insights/today", "Unable to load insights.")
 
-with metrics_tab:
-    st.subheader("Methods + Metrics")
-    st.caption("Not a diagnosis. If you feel unsafe contact local emergency services.")
-    if not st.session_state.token:
-        st.warning("Sign in on the Account tab to continue.")
-    else:
-        metrics_resp = api_get("/metrics/summary?days=30")
-        if metrics_resp is None:
-            st.stop()
-        if not metrics_resp.ok:
+        st.subheader("Methods + Metrics")
+        metrics_query = "/metrics/summary?days=30"
+        if st.session_state.ui_dev_mode and st.session_state.include_low_quality:
+            metrics_query += "&include_low_quality=true"
+        metrics_resp = api_get(metrics_query)
+        if metrics_resp is not None and metrics_resp.ok:
+            metrics = safe_json(metrics_resp) or {}
+            regular = metrics.get("regular", {})
+            rapid = metrics.get("rapid", {})
+            safety = metrics.get("safety", {})
+
+            st.subheader("Regular")
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Check-ins", regular.get("count_checkins", 0))
+            col2.metric("Missing days", regular.get("missing_days", 0))
+            col3.metric("Mean score", regular.get("mean_score", 0))
+            col4, col5, col6 = st.columns(3)
+            col4.metric("Median score", regular.get("median_score", 0))
+            col5.metric("Std score", regular.get("std_score", 0))
+            col6.metric("Trend slope (14d)", regular.get("trend_slope_14d", 0))
+
+            st.subheader("Rapid")
+            rcol1, rcol2, rcol3 = st.columns(3)
+            rcol1.metric("Total", rapid.get("count_total", 0))
+            rcol2.metric("Valid", rapid.get("count_valid", 0))
+            rcol3.metric("Invalid", rapid.get("count_invalid", 0))
+            rcol4, rcol5, rcol6 = st.columns(3)
+            rcol4.metric("Mean time (s)", rapid.get("mean_time_seconds_valid", 0))
+            rcol5.metric("High confidence", rapid.get("confidence_counts", {}).get("high", 0))
+            rcol6.metric("RED count", rapid.get("level_counts", {}).get("red", 0))
+
+            level_counts = rapid.get("level_counts", {})
+            if level_counts:
+                level_df = pd.DataFrame(
+                    [{"level": key, "count": value} for key, value in level_counts.items()]
+                )
+                level_chart = alt.Chart(level_df).mark_bar().encode(
+                    x=alt.X("level:N", title="Level"),
+                    y=alt.Y("count:Q", title="Count"),
+                )
+                st.altair_chart(level_chart, use_container_width=True)
+
+            invalid_counts = rapid.get("invalid_reason_counts", {})
+            if invalid_counts:
+                invalid_df = pd.DataFrame(
+                    [{"reason": key, "count": value} for key, value in invalid_counts.items()]
+                )
+                invalid_chart = alt.Chart(invalid_df).mark_bar().encode(
+                    x=alt.X("reason:N", title="Invalid reason"),
+                    y=alt.Y("count:Q", title="Count"),
+                )
+                st.altair_chart(invalid_chart, use_container_width=True)
+
+            st.subheader("Safety")
+            scol1, scol2, scol3 = st.columns(3)
+            scol1.metric("RED triggers", safety.get("red_trigger_count", 0))
+            scol2.metric("RED + low confidence", safety.get("red_low_confidence_count", 0))
+            scol3.metric("Escalations shown", safety.get("escalation_shown_count", 0))
+
+            st.subheader("Copy for paper")
+            total = rapid.get("count_total", 0)
+            invalid = rapid.get("count_invalid", 0)
+            invalid_pct = (invalid / total * 100) if total else 0
+            invalid_reasons = ", ".join(
+                f"{key} ({value})" for key, value in (invalid_counts or {}).items()
+            ) or "none"
+            paper_text = (
+                f"In 30 days, {total} rapid evaluations were recorded; "
+                f"{invalid_pct:.1f}% were invalid due to {invalid_reasons}. "
+                f"Regular check-ins: {regular.get('count_checkins', 0)} completed; "
+                f"mean score {regular.get('mean_score', 0)}."
+            )
+            st.code(paper_text, language="text")
+        elif metrics_resp is not None:
             show_response_error(metrics_resp, "/metrics/summary", "Unable to load metrics.")
-            st.stop()
-        metrics = safe_json(metrics_resp) or {}
-        regular = metrics.get("regular", {})
-        rapid = metrics.get("rapid", {})
-        safety = metrics.get("safety", {})
 
-        st.subheader("Regular")
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Check-ins", regular.get("count_checkins", 0))
-        col2.metric("Missing days", regular.get("missing_days", 0))
-        col3.metric("Mean score", regular.get("mean_score", 0))
-        col4, col5, col6 = st.columns(3)
-        col4.metric("Median score", regular.get("median_score", 0))
-        col5.metric("Std score", regular.get("std_score", 0))
-        col6.metric("Trend slope (14d)", regular.get("trend_slope_14d", 0))
-
-        st.subheader("Rapid")
-        rcol1, rcol2, rcol3 = st.columns(3)
-        rcol1.metric("Total", rapid.get("count_total", 0))
-        rcol2.metric("Valid", rapid.get("count_valid", 0))
-        rcol3.metric("Invalid", rapid.get("count_invalid", 0))
-        rcol4, rcol5, rcol6 = st.columns(3)
-        rcol4.metric("Mean time (s)", rapid.get("mean_time_seconds_valid", 0))
-        rcol5.metric("High confidence", rapid.get("confidence_counts", {}).get("high", 0))
-        rcol6.metric("RED count", rapid.get("level_counts", {}).get("red", 0))
-
-        level_counts = rapid.get("level_counts", {})
-        if level_counts:
-            level_df = pd.DataFrame(
-                [{"level": key, "count": value} for key, value in level_counts.items()]
-            )
-            level_chart = alt.Chart(level_df).mark_bar().encode(
-                x=alt.X("level:N", title="Level"),
-                y=alt.Y("count:Q", title="Count"),
-            )
-            st.altair_chart(level_chart, use_container_width=True)
-
-        invalid_counts = rapid.get("invalid_reason_counts", {})
-        if invalid_counts:
-            invalid_df = pd.DataFrame(
-                [{"reason": key, "count": value} for key, value in invalid_counts.items()]
-            )
-            invalid_chart = alt.Chart(invalid_df).mark_bar().encode(
-                x=alt.X("reason:N", title="Invalid reason"),
-                y=alt.Y("count:Q", title="Count"),
-            )
-            st.altair_chart(invalid_chart, use_container_width=True)
-
-        st.subheader("Safety")
-        scol1, scol2, scol3 = st.columns(3)
-        scol1.metric("RED triggers", safety.get("red_trigger_count", 0))
-        scol2.metric("RED + low confidence", safety.get("red_low_confidence_count", 0))
-        scol3.metric("Escalations shown", safety.get("escalation_shown_count", 0))
-
-        st.subheader("Copy for paper")
-        total = rapid.get("count_total", 0)
-        invalid = rapid.get("count_invalid", 0)
-        invalid_pct = (invalid / total * 100) if total else 0
-        invalid_reasons = ", ".join(
-            f"{key} ({value})" for key, value in (invalid_counts or {}).items()
-        ) or "none"
-        paper_text = (
-            f"In 30 days, {total} rapid evaluations were recorded; "
-            f"{invalid_pct:.1f}% were invalid due to {invalid_reasons}. "
-            f"Regular check-ins: {regular.get('count_checkins', 0)} completed; "
-            f"mean score {regular.get('mean_score', 0)}."
-        )
-        st.code(paper_text, language="text")

@@ -44,7 +44,7 @@ uvicorn mindtriage.backend.app.main:app --reload
 
 FastAPI docs: http://127.0.0.1:8000/docs
 
-### Dev mode (rapid evaluation limits)
+### Dev mode (backend)
 
 Enable lower rapid-evaluation cooldowns/limits for local testing:
 
@@ -80,7 +80,7 @@ Windows PowerShell:
 $env:DEV_MODE="1"
 ```
 
-This unlocks UI overrides and allows override fields on the backend.
+This unlocks UI overrides and allows override fields on the backend. To show the dev UI, also append `?dev=1` to the Streamlit URL.
 
 ## Run the frontend
 
@@ -105,5 +105,10 @@ The Streamlit app uses `http://127.0.0.1:8000` by default.
 
 ## Export (anonymized)
 
-- Download anonymized data from `/export/anonymized` (zip with CSVs and schema).
+- Download anonymized data from `/export/anonymized` (zip or json).
 - Use `include_journal_text=true` only if you intend to share journal text safely.
+
+## Import (local-first)
+
+- Upload a JSON export in the Export tab to restore data locally.
+- Imports de-duplicate by `(entry_date, type, question_id)` for the current user.
