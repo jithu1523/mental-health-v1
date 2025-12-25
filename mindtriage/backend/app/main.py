@@ -154,9 +154,10 @@ class MicroAnswer(Base):
     entry_date = Column(Date, default=date.today, nullable=False)
     value_json = Column(String, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    answered_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     __table_args__ = (
-        UniqueConstraint("user_id", "entry_date", name="uq_micro_user_date"),
+        UniqueConstraint("user_id", "question_id", "answered_at", name="uq_micro_user_question_time"),
     )
 
 
@@ -294,7 +295,7 @@ class MicroAnswerCreate(BaseModel):
     question_id: int
     value: str
     entry_date: Optional[date] = None
-    override_datetime: Optional[datetime] = None
+    override_entry_date: Optional[date] = None
 
 
 class ActionPlanItem(BaseModel):
@@ -617,6 +618,7 @@ def on_startup() -> None:
     ensure_rapid_columns()
     ensure_onboarding_tables()
     ensure_quality_columns()
+    ensure_micro_schema()
     seed_questions()
     seed_onboarding_profile_questions()
     seed_micro_questions()
@@ -738,6 +740,35 @@ def ensure_quality_columns() -> None:
             connection.execute(text("ALTER TABLE rapid_evaluations ADD COLUMN input_quality_flags_json TEXT DEFAULT '[]'"))
         if "is_low_quality" not in rapid_columns:
             connection.execute(text("ALTER TABLE rapid_evaluations ADD COLUMN is_low_quality BOOLEAN DEFAULT 0"))
+        connection.commit()
+
+
+def ensure_micro_schema() -> None:
+    with engine.connect() as connection:
+        columns = {row[1] for row in connection.execute(text("PRAGMA table_info(micro_answers)"))}
+        if not columns:
+            return
+        if "answered_at" in columns:
+            return
+        connection.execute(text("""
+            CREATE TABLE micro_answers_new (
+                id INTEGER PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                question_id INTEGER NOT NULL,
+                entry_date DATE NOT NULL,
+                value_json TEXT NOT NULL,
+                created_at DATETIME NOT NULL,
+                answered_at DATETIME NOT NULL,
+                CONSTRAINT uq_micro_user_question_time UNIQUE (user_id, question_id, answered_at)
+            )
+        """))
+        connection.execute(text("""
+            INSERT INTO micro_answers_new (id, user_id, question_id, entry_date, value_json, created_at, answered_at)
+            SELECT id, user_id, question_id, entry_date, value_json, created_at, created_at
+            FROM micro_answers
+        """))
+        connection.execute(text("DROP TABLE micro_answers"))
+        connection.execute(text("ALTER TABLE micro_answers_new RENAME TO micro_answers"))
         connection.commit()
 
 
@@ -1038,7 +1069,8 @@ def micro_answer(
     db: Session = Depends(get_db),
 ) -> dict:
     today = date.today()
-    override_dt = payload.override_datetime if is_dev_mode() else None
+    if payload.override_entry_date and not is_dev_mode():
+        raise HTTPException(status_code=403, detail="Developer mode disabled")
     entry_date = payload.entry_date or today
     if not is_dev_mode():
         if payload.entry_date and payload.entry_date != today:
@@ -1047,8 +1079,8 @@ def micro_answer(
                 detail="entry_date must be today unless dev mode is enabled.",
             )
         entry_date = today
-    if override_dt:
-        entry_date = override_dt.date()
+    if payload.override_entry_date:
+        entry_date = payload.override_entry_date
 
     question = (
         db.query(MicroQuestion)
@@ -1065,7 +1097,6 @@ def micro_answer(
     )
     if existing and not is_dev_mode():
         raise HTTPException(status_code=400, detail="Micro check-in already completed for today.")
-
     value = payload.value.strip()
     if question.question_type == "scale":
         if value not in json.loads(question.options_json):
@@ -1076,10 +1107,12 @@ def micro_answer(
     else:
         raise HTTPException(status_code=400, detail="Unknown micro question type.")
 
+    now = datetime.utcnow()
     if existing:
         existing.question_id = question.id
         existing.value_json = json.dumps({"value": value})
-        existing.created_at = override_dt or datetime.utcnow()
+        existing.created_at = now
+        existing.answered_at = now
         saved = existing
     else:
         saved = MicroAnswer(
@@ -1087,7 +1120,8 @@ def micro_answer(
             question_id=question.id,
             entry_date=entry_date,
             value_json=json.dumps({"value": value}),
-            created_at=override_dt or datetime.utcnow(),
+            created_at=now,
+            answered_at=now,
         )
         db.add(saved)
     db.commit()
@@ -1096,6 +1130,7 @@ def micro_answer(
         "saved": True,
         "entry_date": saved.entry_date.isoformat(),
         "created_at": saved.created_at.isoformat(),
+        "answered_at": saved.answered_at.isoformat(),
         "question_id": saved.question_id,
         "value_json": saved.value_json,
     }
@@ -1115,7 +1150,7 @@ def micro_history(
             MicroAnswer.user_id == user.id,
             func.date(MicroAnswer.entry_date) >= start_date.isoformat(),
         )
-        .order_by(MicroAnswer.entry_date.desc(), MicroAnswer.created_at.desc())
+        .order_by(MicroAnswer.entry_date.desc(), MicroAnswer.answered_at.desc())
         .all()
     )
     history = []
@@ -1126,7 +1161,7 @@ def micro_history(
             "question": question.prompt,
             "category": question.category,
             "value": value,
-            "created_at": answer.created_at.isoformat(),
+            "created_at": answer.answered_at.isoformat(),
         })
     return history
 
@@ -1146,14 +1181,14 @@ def debug_micro(
     last_rows = (
         db.query(MicroAnswer)
         .filter(MicroAnswer.user_id == user.id)
-        .order_by(MicroAnswer.created_at.desc())
+        .order_by(MicroAnswer.answered_at.desc())
         .limit(5)
         .all()
     )
     last_items = [
         {
             "entry_date": row.entry_date.isoformat() if row.entry_date else None,
-            "created_at": row.created_at.isoformat(),
+            "created_at": row.answered_at.isoformat(),
             "question_id": row.question_id,
             "value_json": row.value_json,
         }
@@ -1359,6 +1394,8 @@ def submit_answers(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ) -> dict:
+    if payload.override_datetime and not is_dev_mode():
+        raise HTTPException(status_code=403, detail="Developer mode disabled")
     if not payload.answers:
         raise HTTPException(status_code=400, detail="No answers provided")
 
@@ -1442,6 +1479,8 @@ def create_journal_entry(
     content = payload.content.strip()
     if not content:
         raise HTTPException(status_code=400, detail="Journal content cannot be empty")
+    if payload.override_datetime and not is_dev_mode():
+        raise HTTPException(status_code=403, detail="Developer mode disabled")
     now = datetime.utcnow()
     override_dt = payload.override_datetime if is_dev_mode() else None
     if override_dt:
@@ -1746,6 +1785,8 @@ def rapid_submit(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> RapidSubmitResponse:
+    if payload.override_datetime and not is_dev_mode():
+        raise HTTPException(status_code=403, detail="Developer mode disabled")
     now = datetime.utcnow()
     override_dt = payload.override_datetime if is_dev_mode() else None
     if override_dt:

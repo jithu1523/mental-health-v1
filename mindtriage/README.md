@@ -70,6 +70,18 @@ You can also use `DEV_MODE=1` as an alias.
 
 Frontend developer controls (date/time overrides, quality details) appear only when dev mode is enabled in the backend.
 
+### Developer Mode (UI overrides)
+
+Backend and frontend dev tools are disabled by default. To enable:
+
+Windows PowerShell:
+
+```powershell
+$env:DEV_MODE="1"
+```
+
+This unlocks UI overrides and allows override fields on the backend.
+
 ## Run the frontend
 
 In a second terminal (with the venv active):

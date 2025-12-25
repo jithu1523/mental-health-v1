@@ -1,4 +1,5 @@
 from datetime import date, datetime
+import os
 import time
 
 import altair as alt
@@ -134,23 +135,27 @@ else:
     )
     st.error("Start backend with: uvicorn app.main:app --reload --port 8000")
 
-st.sidebar.subheader("Developer Mode")
+dev_ui_enabled = os.getenv("DEV_MODE", "").strip().lower() in {"1", "true", "yes", "on"}
 if "ui_dev_mode" not in st.session_state:
     st.session_state.ui_dev_mode = False
 if "show_quality_details" not in st.session_state:
     st.session_state.show_quality_details = False
-if st.session_state.dev_mode:
-    st.session_state.ui_dev_mode = st.sidebar.checkbox(
-        "Enable developer controls",
-        value=st.session_state.ui_dev_mode,
-    )
-    st.session_state.show_quality_details = st.sidebar.checkbox(
-        "Show quality details",
-        value=st.session_state.show_quality_details,
-    )
+if dev_ui_enabled:
+    st.sidebar.subheader("Developer Mode")
+    if st.session_state.dev_mode:
+        st.session_state.ui_dev_mode = st.sidebar.checkbox(
+            "Enable developer controls",
+            value=st.session_state.ui_dev_mode,
+        )
+        st.session_state.show_quality_details = st.sidebar.checkbox(
+            "Show quality details",
+            value=st.session_state.show_quality_details,
+        )
+    else:
+        st.session_state.ui_dev_mode = False
+        st.sidebar.info("Enable DEV_MODE in backend to unlock developer controls.")
 else:
     st.session_state.ui_dev_mode = False
-    st.sidebar.info("Enable DEV_MODE in backend to unlock developer controls.")
 
 with account_tab:
     st.subheader("Sign up")
@@ -365,7 +370,7 @@ with checkin_tab:
             if st.checkbox("Override date/time (Quick check-in)", key="override_micro_dt"):
                 override_date = st.date_input("Micro override date", value=date.today(), key="micro_override_date")
                 override_time = st.time_input("Micro override time", value=datetime.now().time(), key="micro_override_time")
-                override_micro_dt = datetime.combine(override_date, override_time)
+                override_micro_dt = override_date
         micro_resp = api_get("/micro/today")
         if micro_resp is not None and micro_resp.ok:
             micro = safe_json(micro_resp) or {}
@@ -391,7 +396,7 @@ with checkin_tab:
                             "value": answer_value,
                         }
                         if override_micro_dt:
-                            payload["override_datetime"] = override_micro_dt.isoformat()
+                            payload["override_entry_date"] = override_micro_dt.isoformat()
                         resp = api_post("/micro/answer", json=payload)
                         if resp is not None and resp.ok:
                             st.success("Quick check-in saved.")
