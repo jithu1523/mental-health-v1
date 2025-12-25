@@ -6,6 +6,7 @@ import json
 import os
 import random
 import re
+import shutil
 import uuid
 import zipfile
 from datetime import date, datetime, timedelta
@@ -38,10 +39,29 @@ APP_VERSION = "1.4.0"
 REPO_ROOT = Path(__file__).resolve().parents[3]
 load_dotenv(REPO_ROOT / ".env")
 
-db_env = os.getenv("DB_PATH", "").strip()
-DB_PATH = db_env if db_env else str(REPO_ROOT / "mindtriage.db")
-if not Path(DB_PATH).is_absolute():
-    DB_PATH = str(REPO_ROOT / DB_PATH)
+
+def resolve_db_path() -> str:
+    db_env = (os.getenv("MINDTRIAGE_DB_PATH") or os.getenv("DB_PATH") or "").strip()
+    db_path = Path(db_env) if db_env else (REPO_ROOT / "mindtriage.db")
+    if not db_path.is_absolute():
+        db_path = REPO_ROOT / db_path
+    return str(db_path)
+
+
+def maybe_copy_legacy_db(canonical_path: str) -> None:
+    canonical = Path(canonical_path)
+    legacy = REPO_ROOT / "mindtriage" / "backend" / "mindtriage.db"
+    if canonical.exists() and legacy.exists():
+        print(f"Using canonical DB at {canonical}. Legacy DB still at {legacy}.")
+        return
+    if not canonical.exists() and legacy.exists():
+        canonical.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(legacy, canonical)
+        print(f"Copied legacy DB from {legacy} to {canonical}.")
+
+
+DB_PATH = resolve_db_path()
+maybe_copy_legacy_db(DB_PATH)
 DATABASE_URL = f"sqlite:///{DB_PATH}"
 SECRET_KEY = "CHANGE_ME"
 EXPORT_SALT = "LOCAL_EXPORT_SALT_CHANGE_ME"
@@ -987,7 +1007,7 @@ def health() -> dict:
 
 @app.get("/meta")
 def meta() -> dict:
-    return {"version": APP_VERSION, "dev_mode": is_dev_mode()}
+    return {"version": APP_VERSION, "dev_mode": is_dev_mode(), "db_path": DB_PATH}
 
 
 @app.get("/safety/resources")

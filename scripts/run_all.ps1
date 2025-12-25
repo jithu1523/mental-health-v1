@@ -2,6 +2,8 @@ $ErrorActionPreference = "Stop"
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 
+Set-Location $repoRoot
+
 Write-Host "Starting backend in a new PowerShell window..."
 Start-Process -FilePath "powershell.exe" -ArgumentList "-NoExit", "-File", (Join-Path $repoRoot "scripts\run_backend.ps1")
 

@@ -111,6 +111,10 @@ http://localhost:8501/?dev=1&dev_key=local_only
 
 - Backend health: http://127.0.0.1:8000/health
 - If the frontend cannot connect, ensure port 8000 is free and the backend is running.
+## Database location
+
+- Canonical DB path: `<repo_root>/mindtriage.db`
+- Override with `MINDTRIAGE_DB_PATH` (absolute or repo-relative)
 
 ## Tests
 
