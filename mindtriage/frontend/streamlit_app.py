@@ -19,6 +19,8 @@ if "rapid_session_id" not in st.session_state:
     st.session_state.rapid_session_id = None
 if "rapid_session_date" not in st.session_state:
     st.session_state.rapid_session_date = None
+if "export_bytes" not in st.session_state:
+    st.session_state.export_bytes = None
 
 
 def api_headers() -> dict:
@@ -79,7 +81,10 @@ st.title("MindTriage")
 st.caption("Not a diagnosis. If you feel unsafe contact local emergency services.")
 
 rapid_tab_label = "Rapid Evaluation"
-login_tab, care_tab, rapid_tab = st.tabs(["Account", "Check-in & Journal", rapid_tab_label])
+export_tab_label = "Export"
+login_tab, care_tab, rapid_tab, export_tab = st.tabs(
+    ["Account", "Check-in & Journal", rapid_tab_label, export_tab_label]
+)
 
 st.subheader("Backend connection check")
 health_resp = api_get("/health")
@@ -465,3 +470,38 @@ with rapid_tab:
                 st.info("No rapid evaluations yet.")
         elif history_resp is not None:
             show_response_error(history_resp, "/rapid/history", "Unable to load rapid history.")
+
+with export_tab:
+    st.subheader("Export")
+    st.caption("Not a diagnosis. If you feel unsafe contact local emergency services.")
+    if not st.session_state.token:
+        st.warning("Sign in on the Account tab to continue.")
+    else:
+        days = st.selectbox("Days", [7, 30, 90], index=1)
+        include_text = st.checkbox("Include journal text", value=False)
+        st.warning("Never share exports containing journal text publicly.")
+        if st.button("Download Anonymized Export"):
+            try:
+                resp = requests.get(
+                    api_url("/export/anonymized"),
+                    headers=api_headers(),
+                    params={"days": days, "format": "zip", "include_journal_text": include_text},
+                    timeout=30,
+                )
+            except requests.RequestException as exc:
+                st.error(f"Request failed: {exc}")
+                resp = None
+            if resp is not None and resp.ok:
+                st.session_state.export_bytes = resp.content
+                st.success("Export ready.")
+            elif resp is not None:
+                show_response_error(resp, "/export/anonymized", "Export failed.")
+
+        export_bytes = st.session_state.get("export_bytes")
+        if export_bytes:
+            st.download_button(
+                "Download export zip",
+                data=export_bytes,
+                file_name="mindtriage_export.zip",
+                mime="application/zip",
+            )

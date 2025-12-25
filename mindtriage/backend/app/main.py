@@ -1,13 +1,18 @@
 from __future__ import annotations
 
-import random
-from datetime import date, datetime, timedelta
+import csv
+import io
 import json
 import os
+import random
+import zipfile
+from datetime import date, datetime, timedelta
+from hashlib import sha256
 from typing import List, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import JWTError, jwt
 from passlib.context import CryptContext
@@ -18,6 +23,7 @@ from sqlalchemy.orm import Session, relationship, sessionmaker
 
 DATABASE_URL = "sqlite:///./mindtriage.db"
 SECRET_KEY = "CHANGE_ME"
+EXPORT_SALT = "LOCAL_EXPORT_SALT_CHANGE_ME"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24
 
@@ -1212,6 +1218,38 @@ def clear_demo_data(
     return {"deleted": deleted}
 
 
+@app.get("/export/anonymized")
+def export_anonymized(
+    days: int = Query(30, ge=1, le=365),
+    format: str = Query("zip", pattern="^(zip)$"),
+    include_journal_text: bool = Query(False),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Response:
+    if format != "zip":
+        raise HTTPException(status_code=400, detail="Only zip format is supported.")
+
+    export_bytes = build_export_zip(user, db, days, include_journal_text)
+    filename = f"mindtriage_export_{date.today().isoformat()}.zip"
+    return Response(
+        content=export_bytes,
+        media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
+@app.get("/export/anonymized/self_check")
+def export_anonymized_self_check(
+    days: int = Query(30, ge=1, le=365),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    export_bytes = build_export_zip(user, db, days, include_journal_text=False)
+    email = user.email.lower()
+    pii_detected = email in export_bytes.decode(errors="ignore").lower()
+    return {"pii_detected": pii_detected, "bytes": len(export_bytes)}
+
+
 def compute_rapid_risk(
     answers_by_slug: dict[str, str]
 ) -> tuple[str, int, List[str], List[RapidExplainabilityItem], List[str], Optional[List[str]]]:
@@ -1376,3 +1414,212 @@ def detect_extreme_only_answers(answers_by_slug: dict[str, str]) -> bool:
     if len(numeric_values) < 2:
         return False
     return all(value <= 2 or value >= 9 for value in numeric_values)
+
+
+def pseudonymize_user(user_id: int) -> str:
+    return sha256(f"{user_id}:{EXPORT_SALT}".encode("utf-8")).hexdigest()[:16]
+
+
+def build_export_zip(
+    user: User,
+    db: Session,
+    days: int,
+    include_journal_text: bool,
+) -> bytes:
+    start_date = date.today() - timedelta(days=days - 1)
+    pseudonym = pseudonymize_user(user.id)
+
+    regular_rows = build_regular_checkins_rows(user.id, db, start_date, pseudonym)
+    rapid_rows = build_rapid_rows(user.id, db, start_date, pseudonym)
+    risk_rows = build_risk_history_rows(user.id, db, start_date, pseudonym)
+    journal_rows = build_journal_rows(user.id, db, start_date, pseudonym, include_journal_text)
+
+    schema = {
+        "regular_checkins.csv": list(regular_rows[0].keys()) if regular_rows else [],
+        "rapid_evaluations.csv": list(rapid_rows[0].keys()) if rapid_rows else [],
+        "risk_history.csv": list(risk_rows[0].keys()) if risk_rows else [],
+        "journals.csv": list(journal_rows[0].keys()) if journal_rows else [],
+    }
+
+    readme_text = (
+        "MindTriage anonymized export.\n"
+        "- PII removed (email/username/user_id replaced by pseudonym).\n"
+        "- Includes only the current user's data within the requested date range.\n"
+        "- Journal text included only if include_journal_text=true.\n"
+    )
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("regular_checkins.csv", rows_to_csv(regular_rows))
+        archive.writestr("rapid_evaluations.csv", rows_to_csv(rapid_rows))
+        archive.writestr("risk_history.csv", rows_to_csv(risk_rows))
+        archive.writestr("journals.csv", rows_to_csv(journal_rows))
+        archive.writestr("schema.json", json.dumps(schema, indent=2))
+        archive.writestr("README_EXPORT.txt", readme_text)
+
+    return buffer.getvalue()
+
+
+def rows_to_csv(rows: List[dict]) -> str:
+    if not rows:
+        return ""
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=list(rows[0].keys()))
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(row)
+    return output.getvalue()
+
+
+def build_regular_checkins_rows(
+    user_id: int,
+    db: Session,
+    start_date: date,
+    pseudonym: str,
+) -> List[dict]:
+    answers = (
+        db.query(Answer, Question)
+        .join(Question, Answer.question_id == Question.id)
+        .filter(
+            Answer.user_id == user_id,
+            Answer.entry_date.isnot(None),
+            Answer.entry_date >= start_date,
+        )
+        .order_by(Answer.entry_date.asc(), Answer.created_at.asc())
+        .all()
+    )
+    rows = []
+    for answer, question in answers:
+        rows.append({
+            "subject_id": pseudonym,
+            "entry_date": answer.entry_date.isoformat(),
+            "question_slug": question.slug,
+            "answer_text": answer.answer_text,
+            "created_at": answer.created_at.isoformat(),
+            "is_demo": answer.is_demo,
+        })
+    return rows
+
+
+def build_rapid_rows(
+    user_id: int,
+    db: Session,
+    start_date: date,
+    pseudonym: str,
+) -> List[dict]:
+    evaluations = (
+        db.query(RapidEvaluation)
+        .filter(
+            RapidEvaluation.user_id == user_id,
+            RapidEvaluation.entry_date.isnot(None),
+            RapidEvaluation.entry_date >= start_date,
+            RapidEvaluation.submitted_at.isnot(None),
+        )
+        .order_by(RapidEvaluation.entry_date.asc(), RapidEvaluation.submitted_at.asc())
+        .all()
+    )
+    rows = []
+    for evaluation in evaluations:
+        rows.append({
+            "subject_id": pseudonym,
+            "entry_date": evaluation.entry_date.isoformat(),
+            "score": evaluation.score,
+            "level": evaluation.level,
+            "confidence_score": evaluation.confidence_score,
+            "time_taken_seconds": evaluation.time_taken_seconds,
+            "is_valid": evaluation.is_valid,
+            "quality_flags": evaluation.quality_flags_json,
+            "signals": evaluation.signals_json,
+            "explanations": evaluation.explainability_json,
+            "created_at": evaluation.created_at.isoformat(),
+            "is_demo": evaluation.is_demo,
+        })
+    return rows
+
+
+def build_risk_history_rows(
+    user_id: int,
+    db: Session,
+    start_date: date,
+    pseudonym: str,
+) -> List[dict]:
+    answers = (
+        db.query(Answer, Question)
+        .join(Question, Answer.question_id == Question.id)
+        .filter(
+            Answer.user_id == user_id,
+            Question.kind == "daily",
+            Answer.entry_date.isnot(None),
+            Answer.entry_date >= start_date,
+        )
+        .order_by(Answer.entry_date.asc(), Answer.created_at.desc())
+        .all()
+    )
+    journals = (
+        db.query(JournalEntry)
+        .filter(
+            JournalEntry.user_id == user_id,
+            JournalEntry.entry_date.isnot(None),
+            JournalEntry.entry_date >= start_date,
+        )
+        .order_by(JournalEntry.entry_date.asc(), JournalEntry.created_at.desc())
+        .all()
+    )
+
+    answers_by_date: dict[date, List[tuple[Answer, Question]]] = {}
+    for answer, question in answers:
+        day = answer.entry_date
+        answers_by_date.setdefault(day, []).append((answer, question))
+
+    journals_by_date: dict[date, JournalEntry] = {}
+    for entry in journals:
+        day = entry.entry_date
+        if day not in journals_by_date:
+            journals_by_date[day] = entry
+
+    all_days = sorted(set(answers_by_date.keys()) | set(journals_by_date.keys()))
+    rows = []
+    for day in all_days:
+        day_answers = answers_by_date.get(day, [])
+        day_journal = journals_by_date.get(day)
+        risk_level, score, _, _ = compute_risk_details(day_answers, day_journal)
+        rows.append({
+            "subject_id": pseudonym,
+            "entry_date": day.isoformat(),
+            "score": score,
+            "level": risk_level,
+        })
+    return rows
+
+
+def build_journal_rows(
+    user_id: int,
+    db: Session,
+    start_date: date,
+    pseudonym: str,
+    include_text: bool,
+) -> List[dict]:
+    journals = (
+        db.query(JournalEntry)
+        .filter(
+            JournalEntry.user_id == user_id,
+            JournalEntry.entry_date.isnot(None),
+            JournalEntry.entry_date >= start_date,
+        )
+        .order_by(JournalEntry.entry_date.asc(), JournalEntry.created_at.asc())
+        .all()
+    )
+    rows = []
+    for entry in journals:
+        row = {
+            "subject_id": pseudonym,
+            "entry_date": entry.entry_date.isoformat(),
+            "created_at": entry.created_at.isoformat(),
+            "length": len(entry.content),
+            "sentiment_score": "",
+            "is_demo": entry.is_demo,
+        }
+        if include_text:
+            row["text"] = entry.content
+        rows.append(row)
+    return rows
