@@ -243,6 +243,8 @@ class NextQuestion(BaseModel):
     category: str
     kind: str
     slug: Optional[str] = None
+    question_type: Optional[str] = None
+    options: Optional[List[str]] = None
 
 
 class NextQuestionsResponse(BaseModel):
@@ -3420,11 +3422,14 @@ def build_micro_question_set(db: Session) -> List[dict]:
         meta = pool_by_prompt.get(question.prompt)
         if not meta:
             continue
+        options = json.loads(question.options_json)
         selected.append({
             "id": question.id,
             "text": question.prompt,
             "category": meta["category"],
             "kind": "micro",
+            "question_type": question.question_type,
+            "options": options,
         })
     return selected
 

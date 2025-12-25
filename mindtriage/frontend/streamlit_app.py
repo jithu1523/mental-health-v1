@@ -394,15 +394,25 @@ with micro_tab:
                 micro_payloads = []
                 for question in questions:
                     prompt = question.get("text", "Quick check-in")
-                    category = (question.get("category") or "").lower()
-                    if category in {"mood", "anxiety"}:
-                        value = st.slider(prompt, 0, 10, 5, key=f"micro_{question['id']}")
-                        answer_value = str(value)
-                    elif category == "sleep":
-                        value = st.slider(prompt, 0, 12, 7, key=f"micro_{question['id']}")
-                        answer_value = str(value)
+                    question_type = (question.get("question_type") or "").lower()
+                    options = question.get("options") or []
+                    if question_type == "scale" and options:
+                        default_index = len(options) // 2
+                        answer_value = st.select_slider(
+                            prompt,
+                            options=options,
+                            value=options[default_index],
+                            key=f"micro_{question['id']}",
+                        )
+                    elif question_type == "choice" and options:
+                        answer_value = st.selectbox(
+                            prompt,
+                            options=options,
+                            key=f"micro_{question['id']}",
+                        )
                     else:
                         answer_value = st.text_input(prompt, key=f"micro_{question['id']}")
+                    answer_value = str(answer_value)
                     micro_payloads.append({
                         "question_id": question.get("id"),
                         "value": answer_value,
