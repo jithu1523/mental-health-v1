@@ -391,44 +391,59 @@ with checkin_tab:
         elif status_resp is not None:
             show_response_error(status_resp, "/micro/status", "Unable to load micro status.")
 
-        micro_resp = api_get("/micro/today")
+        micro_resp = api_get(f"/micro/questions?entry_date={micro_status_date.isoformat()}&k=2")
         if micro_resp is not None and micro_resp.ok:
             micro = safe_json(micro_resp) or {}
-            question = micro.get("question")
-            if not question:
+            questions = micro.get("questions", [])
+            if not questions:
                 st.info("No micro check-in available.")
             elif done_for_date:
                 label = "Done for selected date ✅" if override_micro_date else "Done for today ✅"
                 st.success(label)
             else:
                 with st.form("micro_form"):
-                    prompt = question.get("prompt", "Quick check-in")
-                    qtype = question.get("question_type")
-                    options = question.get("options", [])
-                    if qtype == "scale":
-                        value = st.slider(prompt, 1, 5, 3)
-                        answer_value = str(value)
-                    else:
-                        answer_value = st.selectbox(prompt, options)
-                    if st.form_submit_button("Save micro answers"):
-                        payload = {
+                    micro_payloads = []
+                    for idx, question in enumerate(questions):
+                        prompt = question.get("prompt", "Quick check-in")
+                        qtype = question.get("question_type")
+                        options = question.get("options", [])
+                        if qtype == "scale":
+                            value = st.slider(prompt, 1, 5, 3, key=f"micro_scale_{idx}")
+                            answer_value = str(value)
+                        else:
+                            answer_value = st.selectbox(prompt, options, key=f"micro_choice_{idx}")
+                        micro_payloads.append({
                             "question_id": question.get("id"),
                             "value": answer_value,
-                        }
-                        if override_micro_date:
-                            payload["override_entry_date"] = override_micro_date.isoformat()
-                        resp = api_post("/micro/answers", json=payload)
-                        if resp is not None and resp.ok:
+                        })
+                    if st.form_submit_button("Save micro answers"):
+                        saved = 0
+                        for payload in micro_payloads:
+                            if override_micro_date:
+                                payload["override_entry_date"] = override_micro_date.isoformat()
+                            resp = api_post("/micro/answers", json=payload)
+                            if resp is not None and resp.ok:
+                                saved += 1
+                            elif resp is not None:
+                                show_response_error(resp, "/micro/answers", "Unable to save quick check-in.")
+                                break
+                        if saved == len(micro_payloads):
                             st.success("Quick check-in saved.")
-                        elif resp is not None:
-                            show_response_error(resp, "/micro/answers", "Unable to save quick check-in.")
+                            status_resp = api_get(f"/micro/status?entry_date={micro_status_date.isoformat()}")
+                            if status_resp is not None and status_resp.ok:
+                                status_payload = safe_json(status_resp) or {}
+                                done_for_date = bool(status_payload.get("done"))
+                            streak_resp = api_get("/micro/streak")
+                            if streak_resp is not None and streak_resp.ok:
+                                streak_payload = safe_json(streak_resp) or {}
+                                st.session_state.micro_streak_days = streak_payload.get("streak_days", 0)
         elif micro_resp is not None:
-            show_response_error(micro_resp, "/micro/today", "Unable to load quick check-in.")
+            show_response_error(micro_resp, "/micro/questions", "Unable to load quick check-in.")
 
         streak_resp = api_get("/micro/streak")
         if streak_resp is not None and streak_resp.ok:
             streak = safe_json(streak_resp) or {}
-            st.session_state.micro_streak_days = streak.get("current_streak_days", 0)
+            st.session_state.micro_streak_days = streak.get("streak_days", 0)
             st.write(f"Micro streak: {st.session_state.micro_streak_days} days")
         elif streak_resp is not None:
             show_response_error(streak_resp, "/micro/streak", "Unable to load micro streak.")

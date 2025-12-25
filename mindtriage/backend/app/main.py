@@ -1032,16 +1032,7 @@ def micro_today(
     db: Session = Depends(get_db),
 ) -> dict:
     today = date.today()
-    questions = (
-        db.query(MicroQuestion)
-        .filter(MicroQuestion.is_active.is_(True))
-        .order_by(MicroQuestion.id.asc())
-        .all()
-    )
-    if not questions:
-        return {"question": None, "answered": False}
-
-    question = pick_micro_question_for_date(today, questions)
+    questions = pick_micro_questions_for_date(user.id, today, db, k=2)
     answered = (
         db.query(MicroAnswer)
         .filter(
@@ -1051,13 +1042,7 @@ def micro_today(
         .first()
     )
     return {
-        "question": {
-            "id": question.id,
-            "prompt": question.prompt,
-            "question_type": question.question_type,
-            "options": json.loads(question.options_json),
-            "category": question.category,
-        },
+        "questions": questions,
         "answered": answered is not None,
     }
 
@@ -1175,6 +1160,17 @@ def micro_history(
     return history
 
 
+@app.get("/micro/questions")
+def micro_questions(
+    entry_date: date = Query(...),
+    k: int = Query(2, ge=1, le=3),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    questions = pick_micro_questions_for_date(user.id, entry_date, db, k)
+    return {"entry_date": entry_date.isoformat(), "questions": questions}
+
+
 @app.get("/micro/status")
 def micro_status(
     entry_date: date = Query(...),
@@ -1243,14 +1239,13 @@ def micro_streak(
     db: Session = Depends(get_db),
 ) -> dict:
     dates = fetch_micro_dates(user.id, db)
-    today = date.today()
-    answered_today = today in dates
-    current_streak = compute_current_streak(dates, today)
-    best_streak = compute_best_streak(dates)
+    last_entry_date = dates[-1] if dates else None
+    streak = compute_streak_from_latest(dates)
+    entry_dates_last_30 = [d.isoformat() for d in dates[-30:]]
     return {
-        "current_streak_days": current_streak,
-        "best_streak_days": best_streak,
-        "answered_today": answered_today,
+        "streak_days": streak,
+        "last_entry_date": last_entry_date.isoformat() if last_entry_date else None,
+        "entry_dates_last_30": entry_dates_last_30,
     }
 
 
@@ -2926,6 +2921,54 @@ def pick_micro_question_for_date(target_date: date, questions: List[MicroQuestio
     return questions[index]
 
 
+def pick_micro_questions_for_date(user_id: int, entry_date: date, db: Session, k: int) -> List[dict]:
+    questions = (
+        db.query(MicroQuestion)
+        .filter(MicroQuestion.is_active.is_(True))
+        .order_by(MicroQuestion.id.asc())
+        .all()
+    )
+    if not questions:
+        return []
+
+    recent_dates = (
+        db.query(MicroAnswer.entry_date)
+        .filter(MicroAnswer.user_id == user_id)
+        .distinct()
+        .order_by(MicroAnswer.entry_date.desc())
+        .limit(7)
+        .all()
+    )
+    recent_dates = [row[0] for row in recent_dates if row[0]]
+    recent_question_ids = {
+        row[0]
+        for row in db.query(MicroAnswer.question_id)
+        .filter(MicroAnswer.user_id == user_id, MicroAnswer.entry_date.in_(recent_dates))
+        .distinct()
+        .all()
+    }
+
+    available = [q for q in questions if q.id not in recent_question_ids]
+    if len(available) < k:
+        available = questions
+
+    seed_value = f"{user_id}:{entry_date.isoformat()}"
+    rng = random.Random(seed_value)
+    rng.shuffle(available)
+    selected = available[:k]
+
+    return [
+        {
+            "id": q.id,
+            "prompt": q.prompt,
+            "question_type": q.question_type,
+            "options": json.loads(q.options_json),
+            "category": q.category,
+        }
+        for q in selected
+    ]
+
+
 def fetch_micro_dates(user_id: int, db: Session) -> List[date]:
     rows = (
         db.query(MicroAnswer.entry_date)
@@ -2960,6 +3003,18 @@ def compute_best_streak(dates: List[date]) -> int:
         else:
             current = 1
     return best
+
+
+def compute_streak_from_latest(dates: List[date]) -> int:
+    if not dates:
+        return 0
+    date_set = set(dates)
+    expected = max(date_set)
+    streak = 0
+    while expected in date_set:
+        streak += 1
+        expected = expected - timedelta(days=1)
+    return streak
 
 
 def build_micro_signal(user_id: int, db: Session) -> dict:
