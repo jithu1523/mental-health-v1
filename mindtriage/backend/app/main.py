@@ -1189,6 +1189,7 @@ def debug_micro(
         {
             "entry_date": row.entry_date.isoformat() if row.entry_date else None,
             "created_at": row.answered_at.isoformat(),
+            "answered_at": row.answered_at.isoformat(),
             "question_id": row.question_id,
             "value_json": row.value_json,
         }
