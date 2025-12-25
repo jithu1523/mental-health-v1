@@ -257,6 +257,35 @@ class MicroAnswerCreate(BaseModel):
     entry_date: Optional[date] = None
 
 
+class ActionPlanItem(BaseModel):
+    title: str
+    why: str
+    duration_min: Optional[int] = None
+    timeframe: Optional[str] = None
+
+
+class ActionPlanResource(BaseModel):
+    label: str
+    type: str
+    note: str
+
+
+class ActionPlanOutput(BaseModel):
+    next_15_min: List[ActionPlanItem]
+    next_24_hours: List[ActionPlanItem]
+    resources: List[ActionPlanResource]
+    safety_note: str
+
+
+class ActionPlanRequest(BaseModel):
+    risk_level: str
+    confidence: str
+    baseline_deviation_z: Optional[float] = None
+    micro_streak_days: int = 0
+    answered_last_7_days: int = 0
+    self_harm_flag: bool = False
+
+
 class RapidQuestion(BaseModel):
     id: int
     slug: str
@@ -1070,6 +1099,19 @@ def micro_streak(
         "best_streak_days": best_streak,
         "answered_today": answered_today,
     }
+
+
+@app.post("/plan/generate", response_model=ActionPlanOutput)
+def plan_generate(payload: ActionPlanRequest) -> ActionPlanOutput:
+    plan = build_action_plan(
+        risk_level=payload.risk_level,
+        confidence=payload.confidence,
+        baseline_deviation_z=payload.baseline_deviation_z,
+        micro_streak_days=payload.micro_streak_days,
+        answered_last_7_days=payload.answered_last_7_days,
+        self_harm_flag=payload.self_harm_flag,
+    )
+    return ActionPlanOutput(**plan)
 
 
 def is_recent_mood_or_anxiety_low(user_id: int, db: Session) -> bool:
@@ -2524,6 +2566,104 @@ def apply_micro_confidence_bonus(confidence_score: float, micro_signal: dict) ->
     if bonus <= 0:
         return confidence_score
     return min(0.95, confidence_score + bonus)
+
+
+def build_action_plan(
+    risk_level: str,
+    confidence: str,
+    baseline_deviation_z: Optional[float],
+    micro_streak_days: int,
+    answered_last_7_days: int,
+    self_harm_flag: bool,
+) -> dict:
+    normalized = risk_level.strip().lower()
+    if normalized in {"red", "high"}:
+        tier = "red"
+    elif normalized in {"orange"}:
+        tier = "orange"
+    elif normalized in {"yellow", "medium"}:
+        tier = "yellow"
+    else:
+        tier = "green"
+
+    next_15 = []
+    next_24 = []
+    resources = []
+    safety_note = "Not a diagnosis. Use what fits, skip what doesn't."
+
+    if confidence.lower() == "low":
+        safety_note = "Not a diagnosis. This is only an estimate."
+
+    if tier == "red":
+        next_15.extend([
+            {"title": "Pause and breathe slowly", "why": "Short pauses can lower immediate intensity.", "duration_min": 5},
+            {"title": "Move to a safer space", "why": "Distance from triggers can reduce urges.", "duration_min": 5},
+            {"title": "Contact someone you trust", "why": "Support helps you stay grounded.", "duration_min": 10},
+        ])
+        resources.extend([
+            {"label": "Call or text 988 (US)", "type": "crisis", "note": "Immediate support if you feel unsafe."},
+            {"label": "Local emergency services", "type": "crisis", "note": "Use local emergency services if in danger."},
+        ])
+    elif tier in {"orange", "yellow"}:
+        next_15.extend([
+            {"title": "2-minute grounding", "why": "Name 5 things you can see, 4 you can feel.", "duration_min": 5},
+            {"title": "Short walk or stretch", "why": "Movement can reset stress response.", "duration_min": 10},
+        ])
+        next_24.extend([
+            {"title": "Plan a small supportive task", "why": "A single doable step reduces overwhelm.", "timeframe": "today"},
+            {"title": "Connect with a friend", "why": "Light connection can lower isolation.", "timeframe": "tonight"},
+        ])
+        resources.append({"label": "Self-care basics", "type": "selfcare", "note": "Hydrate, eat, and rest if possible."})
+    else:
+        next_15.extend([
+            {"title": "Check in with your body", "why": "Notice tension and soften your shoulders.", "duration_min": 5},
+            {"title": "Small positive action", "why": "Pick one kind thing for yourself.", "duration_min": 10},
+        ])
+        next_24.extend([
+            {"title": "Protect sleep window", "why": "Consistent sleep supports mood.", "timeframe": "tonight"},
+            {"title": "Keep one routine", "why": "Stability helps maintain momentum.", "timeframe": "tomorrow"},
+        ])
+        resources.append({"label": "Mood skills", "type": "education", "note": "Brief journaling or reflection can help."})
+
+    if baseline_deviation_z is not None:
+        if baseline_deviation_z >= 1:
+            next_24.append({
+                "title": "Reduce load slightly",
+                "why": "You're above your usual range today.",
+                "timeframe": "today",
+            })
+        elif baseline_deviation_z <= -1:
+            next_24.append({
+                "title": "Reinforce what's working",
+                "why": "You're below your usual range; keep supports in place.",
+                "timeframe": "today",
+            })
+
+    if answered_last_7_days >= 5:
+        next_24.append({
+            "title": "Keep your micro streak",
+            "why": "Small daily check-ins build stability.",
+            "timeframe": "tomorrow",
+        })
+    elif micro_streak_days == 0:
+        next_24.append({
+            "title": "Try a 10-second check-in",
+            "why": "Short reflection helps spot patterns early.",
+            "timeframe": "today",
+        })
+
+    if self_harm_flag and not any(item["type"] == "crisis" for item in resources):
+        resources.extend([
+            {"label": "Call or text 988 (US)", "type": "crisis", "note": "Immediate support if you feel unsafe."},
+            {"label": "Local emergency services", "type": "crisis", "note": "Use local emergency services if in danger."},
+        ])
+
+    return {
+        "next_15_min": next_15[:3],
+        "next_24_hours": next_24[:3],
+        "resources": resources[:3],
+        "safety_note": safety_note,
+    }
 
 
 def update_user_baseline(user_id: int, db: Session, lookback_days: int = 30) -> Optional[UserBaseline]:

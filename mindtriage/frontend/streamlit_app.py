@@ -21,6 +21,18 @@ if "rapid_session_date" not in st.session_state:
     st.session_state.rapid_session_date = None
 if "export_bytes" not in st.session_state:
     st.session_state.export_bytes = None
+if "action_plan_rapid" not in st.session_state:
+    st.session_state.action_plan_rapid = None
+if "action_plan_regular" not in st.session_state:
+    st.session_state.action_plan_regular = None
+if "micro_signal" not in st.session_state:
+    st.session_state.micro_signal = None
+if "micro_streak_days" not in st.session_state:
+    st.session_state.micro_streak_days = 0
+if "micro_answered_last_7" not in st.session_state:
+    st.session_state.micro_answered_last_7 = 0
+if "baseline_insights" not in st.session_state:
+    st.session_state.baseline_insights = None
 
 
 def api_headers() -> dict:
@@ -228,6 +240,8 @@ with care_tab:
                     if resp is not None and resp.ok:
                         st.success("Daily check-in saved.")
                         st.session_state.daily_questions = None
+                        payload = safe_json(resp) or {}
+                        st.session_state.micro_signal = payload.get("micro_signal")
                     elif resp is not None:
                         st.error(resp.json().get("detail", "Unable to save daily answers."))
 
@@ -267,13 +281,15 @@ with care_tab:
         streak_resp = api_get("/micro/streak")
         if streak_resp is not None and streak_resp.ok:
             streak = safe_json(streak_resp) or {}
-            st.write(f"Micro streak: {streak.get('current_streak_days', 0)} days")
+            st.session_state.micro_streak_days = streak.get("current_streak_days", 0)
+            st.write(f"Micro streak: {st.session_state.micro_streak_days} days")
         elif streak_resp is not None:
             show_response_error(streak_resp, "/micro/streak", "Unable to load micro streak.")
 
         history_resp = api_get("/micro/history?days=7")
         if history_resp is not None and history_resp.ok:
             history = safe_json(history_resp) or []
+            st.session_state.micro_answered_last_7 = len(history)
             if history:
                 st.caption("Last 7 days")
                 st.table(history)
@@ -388,11 +404,14 @@ with care_tab:
                     show_response_error(resp, "/dev/clear_demo", "Unable to clear demo data.")
 
         st.subheader("Triage")
+        risk_level = None
+        reasons = []
         risk_resp = api_get("/risk/latest")
         if risk_resp is not None and risk_resp.ok:
             risk = risk_resp.json()
             st.metric("Risk level", risk.get("risk_level", "unknown"))
             st.write("Score:", risk.get("score", 0))
+            risk_level = risk.get("risk_level")
             reasons = risk.get("reasons", [])
             if reasons:
                 st.write("Signals:", ", ".join(reasons))
@@ -402,6 +421,51 @@ with care_tab:
                 st.write(excerpt)
         elif risk_resp is not None:
             st.error(risk_resp.json().get("detail", "Unable to load risk status."))
+
+        st.subheader("Action Plan")
+        if risk_level:
+            insights = st.session_state.get("baseline_insights") or {}
+            baseline_z = insights.get("z_score") if insights.get("baseline_ready") else None
+            plan_payload = {
+                "risk_level": risk_level,
+                "confidence": "medium",
+                "baseline_deviation_z": baseline_z,
+                "micro_streak_days": st.session_state.micro_streak_days,
+                "answered_last_7_days": st.session_state.micro_answered_last_7,
+                "self_harm_flag": any(
+                    "risk keywords" in reason.lower() for reason in (reasons or [])
+                ),
+            }
+            plan_resp = api_post("/plan/generate", json=plan_payload)
+            if plan_resp is not None and plan_resp.ok:
+                st.session_state.action_plan_regular = safe_json(plan_resp) or {}
+            elif plan_resp is not None:
+                show_response_error(plan_resp, "/plan/generate", "Unable to generate action plan.")
+
+            plan = st.session_state.action_plan_regular
+            if plan:
+                tabs = st.tabs(["Next 15 minutes", "Next 24 hours", "Resources"])
+                with tabs[0]:
+                    for item in plan.get("next_15_min", []):
+                        st.write(f"- {item.get('title')} ({item.get('duration_min', '')} min): {item.get('why')}")
+                with tabs[1]:
+                    for item in plan.get("next_24_hours", []):
+                        st.write(f"- {item.get('title')} ({item.get('timeframe', '')}): {item.get('why')}")
+                with tabs[2]:
+                    for item in plan.get("resources", []):
+                        st.write(f"- {item.get('label')} ({item.get('type')}): {item.get('note')}")
+                st.caption(plan.get("safety_note", ""))
+                if st.button("Save plan to journal (optional)", key="save_plan_regular"):
+                    summary_lines = [item.get("title") for item in plan.get("next_15_min", [])]
+                    summary_lines += [item.get("title") for item in plan.get("next_24_hours", [])]
+                    summary = "Action plan: " + "; ".join(filter(None, summary_lines))
+                    resp = api_post("/journal", json={"content": summary})
+                    if resp is not None and resp.ok:
+                        st.success("Plan saved to journal.")
+                    elif resp is not None:
+                        show_response_error(resp, "/journal", "Unable to save plan.")
+        else:
+            st.info("Complete a daily check-in to generate an action plan.")
 
         st.markdown("<a name='risk-trend'></a>", unsafe_allow_html=True)
         st.subheader("Risk Trend")
@@ -457,6 +521,7 @@ with care_tab:
 
         if insights_resp is not None and insights_resp.ok:
             insights = safe_json(insights_resp) or {}
+            st.session_state.baseline_insights = insights
             if insights.get("baseline_ready"):
                 if "today_score" in insights:
                     st.write(
@@ -555,6 +620,7 @@ with rapid_tab:
             st.metric("Risk level", result.get("level", "unknown"))
             st.write("Score:", result.get("score", 0))
             confidence_score = result.get("confidence_score")
+            confidence_label = "Medium"
             if isinstance(confidence_score, (int, float)):
                 if confidence_score >= 0.8:
                     confidence_label = "High"
@@ -576,6 +642,50 @@ with rapid_tab:
                     reason = item.get("reason", "Signal")
                     weight = item.get("weight", 0)
                     st.write(f"- {reason} (impact {weight})")
+
+            st.subheader("Action Plan")
+            micro_signal = result.get("micro_signal", {})
+            insights = st.session_state.get("baseline_insights") or {}
+            baseline_z = insights.get("z_score") if insights.get("baseline_ready") else None
+            plan_payload = {
+                "risk_level": result.get("level", "green"),
+                "confidence": confidence_label.lower(),
+                "baseline_deviation_z": baseline_z,
+                "micro_streak_days": micro_signal.get("streak_days", 0),
+                "answered_last_7_days": micro_signal.get("answered_last_7_days", 0),
+                "self_harm_flag": any(
+                    "self-harm" in (item.get("reason", "").lower())
+                    for item in explanations
+                ),
+            }
+            plan_resp = api_post("/plan/generate", json=plan_payload)
+            if plan_resp is not None and plan_resp.ok:
+                st.session_state.action_plan_rapid = safe_json(plan_resp) or {}
+            elif plan_resp is not None:
+                show_response_error(plan_resp, "/plan/generate", "Unable to generate action plan.")
+
+            plan = st.session_state.action_plan_rapid
+            if plan:
+                tabs = st.tabs(["Next 15 minutes", "Next 24 hours", "Resources"])
+                with tabs[0]:
+                    for item in plan.get("next_15_min", []):
+                        st.write(f"- {item.get('title')} ({item.get('duration_min', '')} min): {item.get('why')}")
+                with tabs[1]:
+                    for item in plan.get("next_24_hours", []):
+                        st.write(f"- {item.get('title')} ({item.get('timeframe', '')}): {item.get('why')}")
+                with tabs[2]:
+                    for item in plan.get("resources", []):
+                        st.write(f"- {item.get('label')} ({item.get('type')}): {item.get('note')}")
+                st.caption(plan.get("safety_note", ""))
+                if st.button("Save plan to journal (optional)", key="save_plan_rapid"):
+                    summary_lines = [item.get("title") for item in plan.get("next_15_min", [])]
+                    summary_lines += [item.get("title") for item in plan.get("next_24_hours", [])]
+                    summary = "Action plan: " + "; ".join(filter(None, summary_lines))
+                    resp = api_post("/journal", json={"content": summary})
+                    if resp is not None and resp.ok:
+                        st.success("Plan saved to journal.")
+                    elif resp is not None:
+                        show_response_error(resp, "/journal", "Unable to save plan.")
             actions = result.get("recommended_actions", [])
             if actions:
                 st.write("Next 15 minutes:")
