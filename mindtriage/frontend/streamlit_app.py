@@ -111,9 +111,18 @@ st.caption("Not a diagnosis. If you feel unsafe contact local emergency services
 checkin_tab_label = "Check-in & Journal"
 history_tab_label = "Journal History"
 insights_tab_label = "Insights"
+rapid_tab_label = "Rapid Evaluation"
+metrics_tab_label = "Methods + Metrics"
 account_tab_label = "Account"
-checkin_tab, history_tab, insights_tab, account_tab = st.tabs(
-    [checkin_tab_label, history_tab_label, insights_tab_label, account_tab_label]
+checkin_tab, history_tab, insights_tab, rapid_tab, metrics_tab, account_tab = st.tabs(
+    [
+        checkin_tab_label,
+        history_tab_label,
+        insights_tab_label,
+        rapid_tab_label,
+        metrics_tab_label,
+        account_tab_label,
+    ]
 )
 
 st.subheader("Backend connection check")
@@ -549,135 +558,12 @@ with checkin_tab:
 
         st.caption("Not a diagnosis. If you feel unsafe contact local emergency services.")
 
-with insights_tab:
+with rapid_tab:
     st.subheader("Rapid Evaluation")
     st.caption("Not a diagnosis. If you feel unsafe contact local emergency services.")
     if not st.session_state.token:
         st.warning("Sign in on the Account tab to continue.")
     else:
-        st.subheader("Triage Summary")
-        risk_level = None
-        reasons = []
-        risk_resp = api_get("/risk/latest")
-        if risk_resp is not None and risk_resp.ok:
-            risk = risk_resp.json()
-            st.metric("Risk level", risk.get("risk_level", "unknown"))
-            st.write("Score:", risk.get("score", 0))
-            risk_level = risk.get("risk_level")
-            reasons = risk.get("reasons", [])
-            if reasons:
-                st.write("Signals:", ", ".join(reasons))
-            excerpt = risk.get("last_journal_excerpt")
-            if excerpt:
-                st.write("Recent journal excerpt:")
-                st.write(excerpt)
-        elif risk_resp is not None:
-            st.error(risk_resp.json().get("detail", "Unable to load risk status."))
-
-        st.subheader("Action Plan")
-        if risk_level:
-            insights = st.session_state.get("baseline_insights") or {}
-            baseline_z = insights.get("z_score") if insights.get("baseline_ready") else None
-            plan_payload = {
-                "risk_level": risk_level,
-                "confidence": "medium",
-                "baseline_deviation_z": baseline_z,
-                "micro_streak_days": st.session_state.micro_streak_days,
-                "answered_last_7_days": st.session_state.micro_answered_last_7,
-                "self_harm_flag": any(
-                    "risk keywords" in reason.lower() for reason in (reasons or [])
-                ),
-            }
-            plan_resp = api_post("/plan/generate", json=plan_payload)
-            if plan_resp is not None and plan_resp.ok:
-                st.session_state.action_plan_regular = safe_json(plan_resp) or {}
-            elif plan_resp is not None:
-                show_response_error(plan_resp, "/plan/generate", "Unable to generate action plan.")
-
-            plan = st.session_state.action_plan_regular
-            if plan:
-                tabs = st.tabs(["Next 15 minutes", "Next 24 hours", "Resources"])
-                with tabs[0]:
-                    for item in plan.get("next_15_min", []):
-                        st.write(f"- {item.get('title')} ({item.get('duration_min', '')} min): {item.get('why')}")
-                with tabs[1]:
-                    for item in plan.get("next_24_hours", []):
-                        st.write(f"- {item.get('title')} ({item.get('timeframe', '')}): {item.get('why')}")
-                with tabs[2]:
-                    for item in plan.get("resources", []):
-                        st.write(f"- {item.get('label')} ({item.get('type')}): {item.get('note')}")
-                st.caption(plan.get("safety_note", ""))
-        else:
-            st.info("Complete a daily check-in to generate an action plan.")
-
-        st.markdown("<a name='risk-trend'></a>", unsafe_allow_html=True)
-        st.subheader("Risk Trend")
-        history_resp = api_get("/risk/history")
-        if history_resp is not None and history_resp.ok:
-            history = safe_json(history_resp) or []
-            if len(history) == 0:
-                st.info("Add a few daily check-ins to see trends.")
-            elif len(history) == 1:
-                st.info("Need at least 2 days to show a trend.")
-            else:
-                max_score = max(item.get("score", 0) for item in history)
-                chart_max = max(20, max_score + 2)
-                band_data = [
-                    {"ymin": 0, "ymax": 8, "color": "#dff3df"},
-                    {"ymin": 9, "ymax": 17, "color": "#fff2cc"},
-                    {"ymin": 18, "ymax": chart_max, "color": "#ffe1e1"},
-                ]
-                bands_df = pd.DataFrame(band_data)
-                trend_df = pd.DataFrame(history)
-                trend_df["date"] = pd.to_datetime(trend_df["date"])
-
-                band_chart = alt.Chart(bands_df).mark_rect(opacity=0.4).encode(
-                    y=alt.Y("ymin:Q", title="Risk score", scale=alt.Scale(domain=[0, chart_max])),
-                    y2="ymax:Q",
-                    color=alt.Color("color:N", scale=None, legend=None),
-                )
-                line_chart = alt.Chart(trend_df).mark_line(point=True).encode(
-                    x=alt.X("date:T", title="Date"),
-                    y=alt.Y("score:Q", scale=alt.Scale(domain=[0, chart_max])),
-                    tooltip=["date:T", "score:Q", "level:N"],
-                )
-                st.altair_chart(band_chart + line_chart, use_container_width=True)
-        elif history_resp is not None:
-            show_response_error(history_resp, "/risk/history", "Unable to load risk history.")
-
-        st.subheader("Your Baseline")
-        baseline_resp = api_get("/baseline/summary")
-        insights_resp = api_get("/insights/today")
-        if baseline_resp is not None and baseline_resp.ok:
-            baseline = safe_json(baseline_resp) or {}
-            if baseline.get("baseline_ready"):
-                st.success("Baseline ready.")
-                st.write(
-                    f"Mean score: {baseline.get('mean', 0)} | "
-                    f"Std: {baseline.get('std', 0)} | "
-                    f"Samples: {baseline.get('sample_count', 0)}"
-                )
-            else:
-                st.info("Baseline building. Complete at least 5 check-ins.")
-        elif baseline_resp is not None:
-            show_response_error(baseline_resp, "/baseline/summary", "Unable to load baseline summary.")
-
-        if insights_resp is not None and insights_resp.ok:
-            insights = safe_json(insights_resp) or {}
-            st.session_state.baseline_insights = insights
-            if insights.get("baseline_ready"):
-                if "today_score" in insights:
-                    st.write(
-                        f"Today's deviation: z={insights.get('z_score', 0)} "
-                        f"({insights.get('interpretation', '')})."
-                    )
-                else:
-                    st.write(insights.get("message", "No insight for today."))
-            else:
-                st.write(insights.get("message", "Baseline not ready."))
-        elif insights_resp is not None:
-            show_response_error(insights_resp, "/insights/today", "Unable to load insights.")
-
         rapid_date = date.today()
         override_rapid_dt = None
         if st.session_state.ui_dev_mode:
@@ -967,6 +853,135 @@ with history_tab:
             )
 
 with insights_tab:
+    st.subheader("Insights")
+    st.caption("Not a diagnosis. If you feel unsafe contact local emergency services.")
+    if not st.session_state.token:
+        st.warning("Sign in on the Account tab to continue.")
+    else:
+        st.subheader("Triage Summary")
+        risk_level = None
+        reasons = []
+        risk_resp = api_get("/risk/latest")
+        if risk_resp is not None and risk_resp.ok:
+            risk = risk_resp.json()
+            st.metric("Risk level", risk.get("risk_level", "unknown"))
+            st.write("Score:", risk.get("score", 0))
+            risk_level = risk.get("risk_level")
+            reasons = risk.get("reasons", [])
+            if reasons:
+                st.write("Signals:", ", ".join(reasons))
+            excerpt = risk.get("last_journal_excerpt")
+            if excerpt:
+                st.write("Recent journal excerpt:")
+                st.write(excerpt)
+        elif risk_resp is not None:
+            st.error(risk_resp.json().get("detail", "Unable to load risk status."))
+
+        st.subheader("Action Plan")
+        if risk_level:
+            insights = st.session_state.get("baseline_insights") or {}
+            baseline_z = insights.get("z_score") if insights.get("baseline_ready") else None
+            plan_payload = {
+                "risk_level": risk_level,
+                "confidence": "medium",
+                "baseline_deviation_z": baseline_z,
+                "micro_streak_days": st.session_state.micro_streak_days,
+                "answered_last_7_days": st.session_state.micro_answered_last_7,
+                "self_harm_flag": any(
+                    "risk keywords" in reason.lower() for reason in (reasons or [])
+                ),
+            }
+            plan_resp = api_post("/plan/generate", json=plan_payload)
+            if plan_resp is not None and plan_resp.ok:
+                st.session_state.action_plan_regular = safe_json(plan_resp) or {}
+            elif plan_resp is not None:
+                show_response_error(plan_resp, "/plan/generate", "Unable to generate action plan.")
+
+            plan = st.session_state.action_plan_regular
+            if plan:
+                tabs = st.tabs(["Next 15 minutes", "Next 24 hours", "Resources"])
+                with tabs[0]:
+                    for item in plan.get("next_15_min", []):
+                        st.write(f"- {item.get('title')} ({item.get('duration_min', '')} min): {item.get('why')}")
+                with tabs[1]:
+                    for item in plan.get("next_24_hours", []):
+                        st.write(f"- {item.get('title')} ({item.get('timeframe', '')}): {item.get('why')}")
+                with tabs[2]:
+                    for item in plan.get("resources", []):
+                        st.write(f"- {item.get('label')} ({item.get('type')}): {item.get('note')}")
+                st.caption(plan.get("safety_note", ""))
+        else:
+            st.info("Complete a daily check-in to generate an action plan.")
+
+        st.markdown("<a name='risk-trend'></a>", unsafe_allow_html=True)
+        st.subheader("Risk Trend")
+        history_resp = api_get("/risk/history")
+        if history_resp is not None and history_resp.ok:
+            history = safe_json(history_resp) or []
+            if len(history) == 0:
+                st.info("Add a few daily check-ins to see trends.")
+            elif len(history) == 1:
+                st.info("Need at least 2 days to show a trend.")
+            else:
+                max_score = max(item.get("score", 0) for item in history)
+                chart_max = max(20, max_score + 2)
+                band_data = [
+                    {"ymin": 0, "ymax": 8, "color": "#dff3df"},
+                    {"ymin": 9, "ymax": 17, "color": "#fff2cc"},
+                    {"ymin": 18, "ymax": chart_max, "color": "#ffe1e1"},
+                ]
+                bands_df = pd.DataFrame(band_data)
+                trend_df = pd.DataFrame(history)
+                trend_df["date"] = pd.to_datetime(trend_df["date"])
+
+                band_chart = alt.Chart(bands_df).mark_rect(opacity=0.4).encode(
+                    y=alt.Y("ymin:Q", title="Risk score", scale=alt.Scale(domain=[0, chart_max])),
+                    y2="ymax:Q",
+                    color=alt.Color("color:N", scale=None, legend=None),
+                )
+                line_chart = alt.Chart(trend_df).mark_line(point=True).encode(
+                    x=alt.X("date:T", title="Date"),
+                    y=alt.Y("score:Q", scale=alt.Scale(domain=[0, chart_max])),
+                    tooltip=["date:T", "score:Q", "level:N"],
+                )
+                st.altair_chart(band_chart + line_chart, use_container_width=True)
+        elif history_resp is not None:
+            show_response_error(history_resp, "/risk/history", "Unable to load risk history.")
+
+        st.subheader("Your Baseline")
+        baseline_resp = api_get("/baseline/summary")
+        insights_resp = api_get("/insights/today")
+        if baseline_resp is not None and baseline_resp.ok:
+            baseline = safe_json(baseline_resp) or {}
+            if baseline.get("baseline_ready"):
+                st.success("Baseline ready.")
+                st.write(
+                    f"Mean score: {baseline.get('mean', 0)} | "
+                    f"Std: {baseline.get('std', 0)} | "
+                    f"Samples: {baseline.get('sample_count', 0)}"
+                )
+            else:
+                st.info("Baseline building. Complete at least 5 check-ins.")
+        elif baseline_resp is not None:
+            show_response_error(baseline_resp, "/baseline/summary", "Unable to load baseline summary.")
+
+        if insights_resp is not None and insights_resp.ok:
+            insights = safe_json(insights_resp) or {}
+            st.session_state.baseline_insights = insights
+            if insights.get("baseline_ready"):
+                if "today_score" in insights:
+                    st.write(
+                        f"Today's deviation: z={insights.get('z_score', 0)} "
+                        f"({insights.get('interpretation', '')})."
+                    )
+                else:
+                    st.write(insights.get("message", "No insight for today."))
+            else:
+                st.write(insights.get("message", "Baseline not ready."))
+        elif insights_resp is not None:
+            show_response_error(insights_resp, "/insights/today", "Unable to load insights.")
+
+with metrics_tab:
     st.subheader("Methods + Metrics")
     st.caption("Not a diagnosis. If you feel unsafe contact local emergency services.")
     if not st.session_state.token:
