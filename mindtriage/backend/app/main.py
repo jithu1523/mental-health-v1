@@ -29,6 +29,7 @@ from .evaluation_engine import evaluate as run_evaluation
 DATABASE_URL = "sqlite:///./mindtriage.db"
 SECRET_KEY = "CHANGE_ME"
 EXPORT_SALT = "LOCAL_EXPORT_SALT_CHANGE_ME"
+ROTATION_SALT = "LOCAL_ROTATION_SALT_CHANGE_ME"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24
 
@@ -152,6 +153,8 @@ class MicroAnswer(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     question_id = Column(Integer, ForeignKey("micro_questions.id"), nullable=False)
     entry_date = Column(Date, default=date.today, nullable=False)
+    kind = Column(String, nullable=True)
+    category = Column(String, nullable=True)
     value_json = Column(String, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     answered_at = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -203,6 +206,8 @@ class Answer(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     question_id = Column(Integer, ForeignKey("questions.id"), nullable=False)
+    kind = Column(String, nullable=True)
+    category = Column(String, nullable=True)
     answer_text = Column(String, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     entry_date = Column(Date, default=date.today, nullable=True)
@@ -230,6 +235,20 @@ class QuestionResponse(BaseModel):
     kind: str
     slug: str
     text: str
+
+
+class NextQuestion(BaseModel):
+    id: int
+    text: str
+    category: str
+    kind: str
+    slug: Optional[str] = None
+
+
+class NextQuestionsResponse(BaseModel):
+    kind: str
+    date: str
+    questions: List[NextQuestion]
 
 
 class AnswerCreate(BaseModel):
@@ -426,16 +445,29 @@ ONBOARDING_QUESTIONS = [
     {"kind": "onboarding", "slug": "onb_mood", "text": "How would you describe your mood this month?"},
 ]
 
-DAILY_QUESTIONS = [
-    {"kind": "daily", "slug": "daily_mood", "text": "Rate your mood today (1-10)."},
-    {"kind": "daily", "slug": "daily_anxiety", "text": "Rate your anxiety today (1-10)."},
-    {"kind": "daily", "slug": "daily_sleep", "text": "How was your sleep last night?"},
-    {"kind": "daily", "slug": "daily_energy", "text": "How is your energy level today?"},
-    {"kind": "daily", "slug": "daily_stress", "text": "How stressed do you feel today?"},
-    {"kind": "daily", "slug": "daily_focus", "text": "How is your focus today?"},
-    {"kind": "daily", "slug": "daily_isolation", "text": "Do you feel isolated today?"},
-    {"kind": "daily", "slug": "daily_hopeless", "text": "Have you felt hopeless today?"},
+DAILY_CORE = [
+    {"kind": "daily", "slug": "daily_mood", "text": "Rate your mood today (1-10).", "category": "mood"},
+    {"kind": "daily", "slug": "daily_anxiety", "text": "Rate your anxiety today (1-10).", "category": "anxiety"},
+    {"kind": "daily", "slug": "daily_sleep", "text": "How many hours did you sleep?", "category": "sleep"},
+    {"kind": "daily", "slug": "daily_energy", "text": "How is your energy level today?", "category": "energy"},
+    {"kind": "daily", "slug": "daily_stress", "text": "How stressed do you feel today?", "category": "stress"},
+    {"kind": "daily", "slug": "daily_focus", "text": "How is your focus today?", "category": "focus"},
 ]
+
+DAILY_ROTATING_POOL = [
+    {"kind": "daily", "slug": "daily_isolation", "text": "Do you feel isolated today?", "category": "isolation"},
+    {"kind": "daily", "slug": "daily_hopeless", "text": "Have you felt hopeless today?", "category": "hopelessness"},
+    {"kind": "daily", "slug": "daily_irritability", "text": "How irritable do you feel today?", "category": "irritability"},
+    {"kind": "daily", "slug": "daily_appetite", "text": "How is your appetite today?", "category": "appetite"},
+    {"kind": "daily", "slug": "daily_motivation", "text": "How motivated do you feel today?", "category": "motivation"},
+    {"kind": "daily", "slug": "daily_support", "text": "Did you feel supported today?", "category": "support"},
+    {"kind": "daily", "slug": "daily_activity", "text": "Did you get any movement or activity today?", "category": "activity"},
+    {"kind": "daily", "slug": "daily_overwhelm", "text": "How overwhelmed did you feel today?", "category": "overwhelm"},
+    {"kind": "daily", "slug": "daily_confidence", "text": "How confident do you feel today?", "category": "confidence"},
+    {"kind": "daily", "slug": "daily_gratitude", "text": "Name one thing that felt okay today.", "category": "gratitude"},
+]
+
+DAILY_QUESTIONS = DAILY_CORE + DAILY_ROTATING_POOL
 
 ONBOARDING_PROFILE_QUESTIONS = [
     {
@@ -500,12 +532,18 @@ ONBOARDING_PROFILE_QUESTIONS = [
     },
 ]
 
-MICRO_QUESTIONS = [
+MICRO_POOL = [
     {
         "prompt": "How is your mood right now?",
         "question_type": "scale",
         "options": [str(i) for i in range(1, 6)],
         "category": "mood",
+    },
+    {
+        "prompt": "How anxious do you feel right now?",
+        "question_type": "scale",
+        "options": [str(i) for i in range(1, 6)],
+        "category": "anxiety",
     },
     {
         "prompt": "How stressed do you feel right now?",
@@ -514,10 +552,10 @@ MICRO_QUESTIONS = [
         "category": "stress",
     },
     {
-        "prompt": "Did you take a short pause or break today?",
-        "question_type": "choice",
-        "options": ["Yes", "No"],
-        "category": "recovery",
+        "prompt": "How is your energy right now?",
+        "question_type": "scale",
+        "options": [str(i) for i in range(1, 6)],
+        "category": "energy",
     },
     {
         "prompt": "How connected do you feel today?",
@@ -526,12 +564,38 @@ MICRO_QUESTIONS = [
         "category": "connection",
     },
     {
-        "prompt": "How is your energy right now?",
+        "prompt": "How hopeful do you feel right now?",
         "question_type": "scale",
         "options": [str(i) for i in range(1, 6)],
-        "category": "energy",
+        "category": "hopelessness",
+    },
+    {
+        "prompt": "How irritable do you feel right now?",
+        "question_type": "scale",
+        "options": [str(i) for i in range(1, 6)],
+        "category": "irritability",
+    },
+    {
+        "prompt": "How focused do you feel right now?",
+        "question_type": "scale",
+        "options": [str(i) for i in range(1, 6)],
+        "category": "focus",
+    },
+    {
+        "prompt": "How is your appetite right now?",
+        "question_type": "scale",
+        "options": [str(i) for i in range(1, 6)],
+        "category": "appetite",
+    },
+    {
+        "prompt": "Did you take a short pause or break today?",
+        "question_type": "choice",
+        "options": ["Yes", "No"],
+        "category": "recovery",
     },
 ]
+
+MICRO_QUESTIONS = MICRO_POOL
 
 RAPID_QUESTIONS = [
     {
@@ -748,6 +812,10 @@ def ensure_quality_columns() -> None:
             connection.execute(text("ALTER TABLE rapid_evaluations ADD COLUMN is_low_quality BOOLEAN DEFAULT 0"))
 
         answer_columns = {row[1] for row in connection.execute(text("PRAGMA table_info(answers)"))}
+        if "kind" not in answer_columns:
+            connection.execute(text("ALTER TABLE answers ADD COLUMN kind TEXT"))
+        if "category" not in answer_columns:
+            connection.execute(text("ALTER TABLE answers ADD COLUMN category TEXT"))
         if "input_quality_score" not in answer_columns:
             connection.execute(text("ALTER TABLE answers ADD COLUMN input_quality_score INTEGER"))
         if "input_quality_flags_json" not in answer_columns:
@@ -756,6 +824,10 @@ def ensure_quality_columns() -> None:
             connection.execute(text("ALTER TABLE answers ADD COLUMN is_low_quality BOOLEAN DEFAULT 0"))
 
         micro_columns = {row[1] for row in connection.execute(text("PRAGMA table_info(micro_answers)"))}
+        if "kind" not in micro_columns:
+            connection.execute(text("ALTER TABLE micro_answers ADD COLUMN kind TEXT"))
+        if "category" not in micro_columns:
+            connection.execute(text("ALTER TABLE micro_answers ADD COLUMN category TEXT"))
         if "input_quality_score" not in micro_columns:
             connection.execute(text("ALTER TABLE micro_answers ADD COLUMN input_quality_score INTEGER"))
         if "input_quality_flags_json" not in micro_columns:
@@ -778,6 +850,8 @@ def ensure_micro_schema() -> None:
                 user_id INTEGER NOT NULL,
                 question_id INTEGER NOT NULL,
                 entry_date DATE NOT NULL,
+                kind TEXT,
+                category TEXT,
                 value_json TEXT NOT NULL,
                 created_at DATETIME NOT NULL,
                 answered_at DATETIME NOT NULL,
@@ -789,10 +863,10 @@ def ensure_micro_schema() -> None:
         """))
         connection.execute(text("""
             INSERT INTO micro_answers_new (
-                id, user_id, question_id, entry_date, value_json, created_at, answered_at,
+                id, user_id, question_id, entry_date, kind, category, value_json, created_at, answered_at,
                 input_quality_score, input_quality_flags_json, is_low_quality
             )
-            SELECT id, user_id, question_id, entry_date, value_json, created_at, created_at,
+            SELECT id, user_id, question_id, entry_date, 'micro', NULL, value_json, created_at, created_at,
                    NULL, '[]', 0
             FROM micro_answers
         """))
@@ -910,6 +984,26 @@ def get_questions(
     return [QuestionResponse(id=q.id, kind=q.kind, slug=q.slug, text=q.text) for q in questions]
 
 
+@app.get("/questions/next", response_model=NextQuestionsResponse)
+def get_next_questions(
+    kind: str = Query(..., pattern="^(micro|daily)$"),
+    date_override: Optional[date] = Query(None, alias="date"),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> NextQuestionsResponse:
+    target_date = local_today()
+    if date_override is not None:
+        if not is_dev_mode():
+            raise HTTPException(status_code=403, detail="Developer mode disabled")
+        target_date = date_override
+    questions = select_next_questions(user.id, kind, target_date, db)
+    return NextQuestionsResponse(
+        kind=kind,
+        date=target_date.isoformat(),
+        questions=[NextQuestion(**item) for item in questions],
+    )
+
+
 @app.get("/onboarding/status")
 def onboarding_status(
     user: User = Depends(get_current_user),
@@ -961,21 +1055,19 @@ def daily_pick(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ) -> List[QuestionResponse]:
-    daily_questions = db.query(Question).filter(Question.kind == "daily").all()
-    questions_by_slug = {q.slug: q for q in daily_questions}
-    if len(daily_questions) < 3:
-        raise HTTPException(status_code=500, detail="Daily question set incomplete")
-
-    bad_recent = is_recent_mood_or_anxiety_low(user.id, db)
-
-    chosen = []
-    if bad_recent and "daily_hopeless" in questions_by_slug:
-        chosen.append(questions_by_slug["daily_hopeless"])
-
-    remaining = [q for q in daily_questions if q not in chosen]
-    chosen.extend(random.sample(remaining, k=3 - len(chosen)))
-
-    return [QuestionResponse(id=q.id, kind=q.kind, slug=q.slug, text=q.text) for q in chosen]
+    today = local_today()
+    questions = select_next_questions(user.id, "daily", today, db)
+    if not questions:
+        return []
+    return [
+        QuestionResponse(
+            id=item["id"],
+            kind="daily",
+            slug=item.get("slug") or "",
+            text=item["text"],
+        )
+        for item in questions
+    ]
 
 
 @app.get("/onboarding/questions", response_model=List[OnboardingQuestionResponse])
@@ -1065,19 +1157,19 @@ def micro_today(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
-    today = date.today()
-    questions = pick_micro_questions_for_date(user.id, today, db, k=2)
+    today = local_today()
+    questions = select_next_questions(user.id, "micro", today, db)
     answered = (
         db.query(MicroAnswer)
         .filter(
             MicroAnswer.user_id == user.id,
             MicroAnswer.entry_date == today,
         )
-        .first()
+        .count()
     )
     return {
         "questions": questions,
-        "answered": answered is not None,
+        "answered": answered > 0,
     }
 
 
@@ -1087,7 +1179,7 @@ def micro_answer(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
-    today = date.today()
+    today = local_today()
     if payload.override_entry_date and not is_dev_mode():
         raise HTTPException(status_code=403, detail="Developer mode disabled")
     entry_date = payload.entry_date or today
@@ -1111,11 +1203,13 @@ def micro_answer(
 
     existing = (
         db.query(MicroAnswer)
-        .filter(MicroAnswer.user_id == user.id, MicroAnswer.entry_date == entry_date)
+        .filter(
+            MicroAnswer.user_id == user.id,
+            MicroAnswer.entry_date == entry_date,
+            MicroAnswer.question_id == payload.question_id,
+        )
         .first()
     )
-    if existing and not is_dev_mode():
-        raise HTTPException(status_code=400, detail="Micro check-in already completed for today.")
     value = payload.value.strip()
     if question.question_type == "scale":
         if value not in json.loads(question.options_json):
@@ -1149,6 +1243,8 @@ def micro_answer(
         existing.value_json = json.dumps({"value": value})
         existing.created_at = now
         existing.answered_at = now
+        existing.kind = "micro"
+        existing.category = question.category
         existing.input_quality_score = quality["quality_score"]
         existing.input_quality_flags_json = json.dumps(quality["flags"])
         existing.is_low_quality = quality["is_low_quality"]
@@ -1158,6 +1254,8 @@ def micro_answer(
             user_id=user.id,
             question_id=question.id,
             entry_date=entry_date,
+            kind="micro",
+            category=question.category,
             value_json=json.dumps({"value": value}),
             created_at=now,
             answered_at=now,
@@ -1235,7 +1333,8 @@ def micro_questions(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
-    questions = pick_micro_questions_for_date(user.id, entry_date, db, k)
+    questions = select_next_questions(user.id, "micro", entry_date, db)
+    questions = questions[:k]
     return {"entry_date": entry_date.isoformat(), "questions": questions}
 
 
@@ -1254,7 +1353,7 @@ def micro_status(
         .order_by(MicroAnswer.answered_at.desc())
         .all()
     )
-    done = len(rows) > 0
+    done = len({row.question_id for row in rows}) >= 2
     last_created = rows[0].answered_at.isoformat() if rows else None
     return {
         "entry_date": entry_date.isoformat(),
@@ -1502,13 +1601,14 @@ def submit_answers(
 
     question_ids = [item.question_id for item in payload.answers]
     questions = db.query(Question).filter(Question.id.in_(question_ids)).all()
+    question_map = {q.id: q for q in questions}
     existing_questions = {q.id for q in questions}
     is_daily = any(q.kind == "daily" for q in questions)
     missing = [qid for qid in question_ids if qid not in existing_questions]
     if missing:
         raise HTTPException(status_code=400, detail=f"Unknown question IDs: {missing}")
 
-    today = date.today()
+    today = local_today()
     override_dt = payload.override_datetime if is_dev_mode() else None
     if override_dt:
         today = override_dt.date()
@@ -1554,23 +1654,57 @@ def submit_answers(
         current_texts = [item.answer_text.strip() for item in payload.answers]
         quality = assess_structured_quality(current_texts, recent_texts, short_window_count)
 
+    daily_category_map = build_daily_category_map(db) if is_daily else {}
     created = []
     for item in payload.answers:
         entry_date = item.entry_date or today
         if not is_dev_mode():
             entry_date = today
         created_at = override_dt if override_dt else datetime.utcnow()
-        created.append(Answer(
-            user_id=user.id,
-            question_id=item.question_id,
-            answer_text=item.answer_text.strip(),
-            entry_date=entry_date,
-            created_at=created_at,
-            input_quality_score=quality["quality_score"] if quality else None,
-            input_quality_flags_json=json.dumps(quality["flags"]) if quality else "[]",
-            is_low_quality=quality["is_low_quality"] if quality else False,
-        ))
-    db.add_all(created)
+        question = question_map.get(item.question_id)
+        category = None
+        kind = None
+        if question:
+            kind = question.kind
+            if question.kind == "daily":
+                category = daily_category_map.get(question.id)
+            else:
+                category = question.kind
+
+        existing = (
+            db.query(Answer)
+            .filter(
+                Answer.user_id == user.id,
+                Answer.question_id == item.question_id,
+                Answer.entry_date == entry_date,
+            )
+            .first()
+        )
+        if existing:
+            existing.answer_text = item.answer_text.strip()
+            existing.entry_date = entry_date
+            existing.created_at = created_at
+            existing.kind = kind
+            existing.category = category
+            if quality:
+                existing.input_quality_score = quality["quality_score"]
+                existing.input_quality_flags_json = json.dumps(quality["flags"])
+                existing.is_low_quality = quality["is_low_quality"]
+            created.append(existing)
+        else:
+            created.append(Answer(
+                user_id=user.id,
+                question_id=item.question_id,
+                answer_text=item.answer_text.strip(),
+                entry_date=entry_date,
+                created_at=created_at,
+                kind=kind,
+                category=category,
+                input_quality_score=quality["quality_score"] if quality else None,
+                input_quality_flags_json=json.dumps(quality["flags"]) if quality else "[]",
+                is_low_quality=quality["is_low_quality"] if quality else False,
+            ))
+    db.add_all([item for item in created if item.id is None])
     db.commit()
     update_user_baseline(user.id, db)
     response = {"saved": len(created), "micro_signal": build_micro_signal(user.id, db)}
@@ -2373,6 +2507,7 @@ async def import_anonymized(
         q.slug: q.id
         for q in db.query(Question).all()
     }
+    daily_category_map = build_daily_category_map(db)
     existing_answer_keys = {
         (entry.entry_date.isoformat(), entry.question_id)
         for entry in db.query(Answer)
@@ -2416,6 +2551,8 @@ async def import_anonymized(
             answer_text=str(row.get("answer_text", "")).strip(),
             entry_date=parsed_date,
             created_at=created_at,
+            kind=row.get("kind") or "daily",
+            category=row.get("category") or daily_category_map.get(question_id),
         )
         db.add(answer)
         existing_answer_keys.add(key)
@@ -2871,6 +3008,7 @@ def build_regular_checkins_rows(
     start_date: date,
     pseudonym: str,
 ) -> List[dict]:
+    category_map = build_daily_category_map(db)
     answers = (
         db.query(Answer, Question)
         .join(Question, Answer.question_id == Question.id)
@@ -2888,6 +3026,8 @@ def build_regular_checkins_rows(
             "subject_id": pseudonym,
             "entry_date": answer.entry_date.isoformat(),
             "question_slug": question.slug,
+            "kind": answer.kind or question.kind,
+            "category": answer.category or category_map.get(answer.question_id),
             "answer_text": answer.answer_text,
             "created_at": answer.created_at.isoformat(),
             "is_demo": answer.is_demo,
@@ -3191,57 +3331,237 @@ def compute_trend_slope(scores_by_day: dict[date, int], lookback_days: int) -> f
     return numerator / denominator
 
 
-def pick_micro_question_for_date(target_date: date, questions: List[MicroQuestion]) -> MicroQuestion:
-    index = target_date.toordinal() % len(questions)
-    return questions[index]
+def local_today() -> date:
+    return datetime.now().date()
 
 
-def pick_micro_questions_for_date(user_id: int, entry_date: date, db: Session, k: int) -> List[dict]:
+def build_rotation_seed(user_id: int, target_date: date, kind: str) -> int:
+    seed_material = f"{user_id}:{target_date.isoformat()}:{kind}:{ROTATION_SALT}"
+    digest = sha256(seed_material.encode("utf-8")).hexdigest()
+    return int(digest[:16], 16)
+
+
+def select_questions_with_seed(
+    questions: List[dict],
+    missing_categories: set[str],
+    recent_question_ids: set[int],
+    exclude_ids: set[int],
+    count: int,
+    seed: int,
+) -> List[dict]:
+    if count <= 0:
+        return []
+    candidates = [q for q in questions if q["id"] not in exclude_ids]
+    if not candidates:
+        return []
+    fresh = [q for q in candidates if q["id"] not in recent_question_ids]
+    ordered_candidates = fresh if len(fresh) >= count else fresh + [q for q in candidates if q["id"] in recent_question_ids]
+    missing = [q for q in ordered_candidates if q.get("category") in missing_categories]
+    others = [q for q in ordered_candidates if q.get("category") not in missing_categories]
+    rng = random.Random(seed)
+    rng.shuffle(missing)
+    rng.shuffle(others)
+    selected = missing[:count]
+    if len(selected) < count:
+        selected.extend(others[: count - len(selected)])
+    return selected
+
+
+def build_daily_question_sets(db: Session) -> tuple[List[dict], List[dict]]:
+    daily_questions = (
+        db.query(Question)
+        .filter(Question.kind == "daily")
+        .all()
+    )
+    by_slug = {q.slug: q for q in daily_questions}
+    core = []
+    for item in DAILY_CORE:
+        question = by_slug.get(item["slug"])
+        if question:
+            core.append({
+                "id": question.id,
+                "slug": question.slug,
+                "text": question.text,
+                "category": item["category"],
+                "kind": "daily",
+            })
+    rotating = []
+    for item in DAILY_ROTATING_POOL:
+        question = by_slug.get(item["slug"])
+        if question:
+            rotating.append({
+                "id": question.id,
+                "slug": question.slug,
+                "text": question.text,
+                "category": item["category"],
+                "kind": "daily",
+            })
+    return core, rotating
+
+
+def build_daily_category_map(db: Session) -> dict[int, str]:
+    core, rotating = build_daily_question_sets(db)
+    return {item["id"]: item["category"] for item in core + rotating}
+
+
+def build_micro_question_set(db: Session) -> List[dict]:
+    pool_by_prompt = {item["prompt"]: item for item in MICRO_POOL}
     questions = (
         db.query(MicroQuestion)
         .filter(MicroQuestion.is_active.is_(True))
-        .order_by(MicroQuestion.id.asc())
         .all()
     )
-    if not questions:
-        return []
+    selected = []
+    for question in questions:
+        meta = pool_by_prompt.get(question.prompt)
+        if not meta:
+            continue
+        selected.append({
+            "id": question.id,
+            "text": question.prompt,
+            "category": meta["category"],
+            "kind": "micro",
+        })
+    return selected
 
-    recent_dates = (
-        db.query(MicroAnswer.entry_date)
-        .filter(MicroAnswer.user_id == user_id)
+
+def collect_recent_question_ids(
+    user_id: int,
+    kind: str,
+    start_date: date,
+    db: Session,
+) -> set[int]:
+    if kind == "micro":
+        rows = (
+            db.query(MicroAnswer.question_id)
+            .filter(
+                MicroAnswer.user_id == user_id,
+                MicroAnswer.entry_date >= start_date,
+                MicroAnswer.is_low_quality.is_(False),
+            )
+            .distinct()
+            .all()
+        )
+        return {row[0] for row in rows}
+    rows = (
+        db.query(Answer.question_id)
+        .join(Question, Answer.question_id == Question.id)
+        .filter(
+            Answer.user_id == user_id,
+            Answer.entry_date >= start_date,
+            Answer.is_low_quality.is_(False),
+            Question.kind == "daily",
+        )
         .distinct()
-        .order_by(MicroAnswer.entry_date.desc())
-        .limit(7)
         .all()
     )
-    recent_dates = [row[0] for row in recent_dates if row[0]]
-    recent_question_ids = {
+    return {row[0] for row in rows}
+
+
+def collect_recent_categories(
+    user_id: int,
+    kind: str,
+    start_date: date,
+    question_category_map: dict[int, str],
+    db: Session,
+) -> set[str]:
+    categories: set[str] = set()
+    if kind == "micro":
+        answers = (
+            db.query(MicroAnswer)
+            .filter(
+                MicroAnswer.user_id == user_id,
+                MicroAnswer.entry_date >= start_date,
+                MicroAnswer.is_low_quality.is_(False),
+            )
+            .all()
+        )
+        for answer in answers:
+            category = answer.category or question_category_map.get(answer.question_id)
+            if category:
+                categories.add(category)
+        return categories
+
+    answers = (
+        db.query(Answer)
+        .join(Question, Answer.question_id == Question.id)
+        .filter(
+            Answer.user_id == user_id,
+            Answer.entry_date >= start_date,
+            Answer.is_low_quality.is_(False),
+            Question.kind == "daily",
+        )
+        .all()
+    )
+    for answer in answers:
+        category = answer.category or question_category_map.get(answer.question_id)
+        if category:
+            categories.add(category)
+    return categories
+
+
+def select_next_questions(
+    user_id: int,
+    kind: str,
+    target_date: date,
+    db: Session,
+) -> List[dict]:
+    start_date = target_date - timedelta(days=6)
+    seed = build_rotation_seed(user_id, target_date, kind)
+
+    if kind == "micro":
+        pool = build_micro_question_set(db)
+        category_map = {item["id"]: item["category"] for item in pool}
+        answered_today = {
+            row[0]
+            for row in db.query(MicroAnswer.question_id)
+            .filter(
+                MicroAnswer.user_id == user_id,
+                MicroAnswer.entry_date == target_date,
+            )
+            .distinct()
+            .all()
+        }
+        recent_question_ids = collect_recent_question_ids(user_id, kind, start_date, db)
+        recent_categories = collect_recent_categories(user_id, kind, start_date, category_map, db)
+        missing_categories = {item["category"] for item in pool} - recent_categories
+        selected = select_questions_with_seed(
+            pool,
+            missing_categories,
+            recent_question_ids,
+            answered_today,
+            count=2,
+            seed=seed,
+        )
+        return selected
+
+    core, rotating = build_daily_question_sets(db)
+    category_map = {item["id"]: item["category"] for item in core + rotating}
+    answered_today = {
         row[0]
-        for row in db.query(MicroAnswer.question_id)
-        .filter(MicroAnswer.user_id == user_id, MicroAnswer.entry_date.in_(recent_dates))
+        for row in db.query(Answer.question_id)
+        .join(Question, Answer.question_id == Question.id)
+        .filter(
+            Answer.user_id == user_id,
+            Answer.entry_date == target_date,
+            Question.kind == "daily",
+        )
         .distinct()
         .all()
     }
-
-    available = [q for q in questions if q.id not in recent_question_ids]
-    if len(available) < k:
-        available = questions
-
-    seed_value = f"{user_id}:{entry_date.isoformat()}"
-    rng = random.Random(seed_value)
-    rng.shuffle(available)
-    selected = available[:k]
-
-    return [
-        {
-            "id": q.id,
-            "prompt": q.prompt,
-            "question_type": q.question_type,
-            "options": json.loads(q.options_json),
-            "category": q.category,
-        }
-        for q in selected
-    ]
+    recent_question_ids = collect_recent_question_ids(user_id, kind, start_date, db)
+    recent_categories = collect_recent_categories(user_id, kind, start_date, category_map, db)
+    missing_categories = {item["category"] for item in rotating} - recent_categories
+    core_remaining = [item for item in core if item["id"] not in answered_today]
+    rotating_selected = select_questions_with_seed(
+        rotating,
+        missing_categories,
+        recent_question_ids,
+        answered_today | {item["id"] for item in core},
+        count=2,
+        seed=seed,
+    )
+    return core_remaining + rotating_selected
 
 
 def fetch_micro_dates(user_id: int, db: Session, include_low_quality: bool = False) -> List[date]:

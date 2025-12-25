@@ -371,72 +371,75 @@ with micro_tab:
                     value=date.today(),
                     key="micro_override_date",
                 )
-        micro_status_date = override_micro_date or date.today()
-        status_resp = api_get(f"/micro/status?entry_date={micro_status_date.isoformat()}")
-        done_for_date = False
-        if status_resp is not None and status_resp.ok:
-            status_payload = safe_json(status_resp) or {}
-            done_for_date = bool(status_payload.get("done"))
-        elif status_resp is not None:
-            show_response_error(status_resp, "/micro/status", "Unable to load micro status.")
+        micro_target_date = override_micro_date or date.today()
+        questions_path = "/questions/next?kind=micro"
+        if override_micro_date:
+            questions_path += f"&date={micro_target_date.isoformat()}"
+        questions_resp = api_get(questions_path)
+        questions = []
+        questions_loaded = questions_resp is not None and questions_resp.ok
+        if questions_loaded:
+            payload = safe_json(questions_resp) or {}
+            questions = payload.get("questions", [])
+        elif questions_resp is not None:
+            show_response_error(questions_resp, "/questions/next", "Unable to load quick check-in.")
 
-        micro_resp = api_get(f"/micro/questions?entry_date={micro_status_date.isoformat()}&k=2")
-        if micro_resp is not None and micro_resp.ok:
-            micro = safe_json(micro_resp) or {}
-            questions = micro.get("questions", [])
-            if not questions:
-                st.info("No micro check-in available.")
-            elif done_for_date:
-                label = "Done for selected date" if override_micro_date else "Done for today"
-                st.success(label)
-            else:
-                with st.form("micro_form"):
-                    micro_payloads = []
-                    for idx, question in enumerate(questions):
-                        prompt = question.get("prompt", "Quick check-in")
-                        qtype = question.get("question_type")
-                        options = question.get("options", [])
-                        if qtype == "scale":
-                            value = st.slider(prompt, 1, 5, 3, key=f"micro_scale_{idx}")
-                            answer_value = str(value)
+        if not questions_loaded:
+            st.info("Quick check-in is unavailable right now.")
+        elif not questions:
+            label = "Done for selected date" if override_micro_date else "Done for today"
+            st.success(label)
+        else:
+            with st.form("micro_form"):
+                micro_payloads = []
+                for question in questions:
+                    prompt = question.get("text", "Quick check-in")
+                    category = (question.get("category") or "").lower()
+                    if category in {"mood", "anxiety"}:
+                        value = st.slider(prompt, 0, 10, 5, key=f"micro_{question['id']}")
+                        answer_value = str(value)
+                    elif category == "sleep":
+                        value = st.slider(prompt, 0, 12, 7, key=f"micro_{question['id']}")
+                        answer_value = str(value)
+                    else:
+                        answer_value = st.text_input(prompt, key=f"micro_{question['id']}")
+                    micro_payloads.append({
+                        "question_id": question.get("id"),
+                        "value": answer_value,
+                    })
+                if st.form_submit_button("Save micro answers"):
+                    saved = 0
+                    reason_summaries = []
+                    for payload in micro_payloads:
+                        if override_micro_date:
+                            payload["override_entry_date"] = override_micro_date.isoformat()
+                        resp = api_post("/micro/answers", json=payload)
+                        if resp is not None and resp.ok:
+                            saved += 1
+                            resp_payload = safe_json(resp) or {}
+                            if resp_payload.get("is_low_quality"):
+                                reason_summaries.append(resp_payload.get("reason_summary"))
+                        elif resp is not None:
+                            show_response_error(resp, "/micro/answers", "Unable to save quick check-in.")
+                            break
+                    if saved == len(micro_payloads):
+                        if reason_summaries:
+                            reason_text = "; ".join(filter(None, reason_summaries)) or "Too brief."
+                            st.warning(f"Low quality: {reason_text}. Try adding 1-2 sentences.")
                         else:
-                            answer_value = st.selectbox(prompt, options, key=f"micro_choice_{idx}")
-                        micro_payloads.append({
-                            "question_id": question.get("id"),
-                            "value": answer_value,
-                        })
-                    if st.form_submit_button("Save micro answers"):
-                        saved = 0
-                        reason_summaries = []
-                        for payload in micro_payloads:
-                            if override_micro_date:
-                                payload["override_entry_date"] = override_micro_date.isoformat()
-                            resp = api_post("/micro/answers", json=payload)
-                            if resp is not None and resp.ok:
-                                saved += 1
-                                resp_payload = safe_json(resp) or {}
-                                if resp_payload.get("is_low_quality"):
-                                    reason_summaries.append(resp_payload.get("reason_summary"))
-                            elif resp is not None:
-                                show_response_error(resp, "/micro/answers", "Unable to save quick check-in.")
-                                break
-                        if saved == len(micro_payloads):
-                            if reason_summaries:
-                                reason_text = "; ".join(filter(None, reason_summaries)) or "Too brief."
-                                st.warning(f"Low quality: {reason_text}. Try adding 1-2 sentences.")
-                            else:
-                                st.success("Quick check-in saved.")
-                            status_resp = api_get(f"/micro/status?entry_date={micro_status_date.isoformat()}")
-                            if status_resp is not None and status_resp.ok:
-                                status_payload = safe_json(status_resp) or {}
-                                done_for_date = bool(status_payload.get("done"))
-                            streak_query = "?include_low_quality=true" if st.session_state.include_low_quality else ""
-                            streak_resp = api_get(f"/micro/streak{streak_query}")
-                            if streak_resp is not None and streak_resp.ok:
-                                streak_payload = safe_json(streak_resp) or {}
-                                st.session_state.micro_streak_days = streak_payload.get("streak_days", 0)
-        elif micro_resp is not None:
-            show_response_error(micro_resp, "/micro/questions", "Unable to load quick check-in.")
+                            st.success("Quick check-in saved.")
+                        refresh_resp = api_get(questions_path)
+                        if refresh_resp is not None and refresh_resp.ok:
+                            payload = safe_json(refresh_resp) or {}
+                            questions = payload.get("questions", [])
+                        if not questions:
+                            label = "Done for selected date" if override_micro_date else "Done for today"
+                            st.success(label)
+                        streak_query = "?include_low_quality=true" if st.session_state.include_low_quality else ""
+                        streak_resp = api_get(f"/micro/streak{streak_query}")
+                        if streak_resp is not None and streak_resp.ok:
+                            streak_payload = safe_json(streak_resp) or {}
+                            st.session_state.micro_streak_days = streak_payload.get("streak_days", 0)
 
         streak_query = "?include_low_quality=true" if st.session_state.include_low_quality else ""
         streak_resp = api_get(f"/micro/streak{streak_query}")
@@ -501,26 +504,36 @@ with daily_tab:
                 override_time = st.time_input("Daily override time", value=datetime.now().time(), key="daily_override_time")
                 override_daily_dt = datetime.combine(override_date, override_time)
                 selected_checkin_date = override_date
-        if st.button("Load daily questions") or st.session_state.daily_questions is None:
-            pick_resp = api_get("/daily/pick")
+        questions_path = "/questions/next?kind=daily"
+        if override_daily_dt:
+            questions_path += f"&date={selected_checkin_date.isoformat()}"
+        if st.button("Refresh daily questions") or st.session_state.daily_questions is None:
+            pick_resp = api_get(questions_path)
             if pick_resp is not None and pick_resp.ok:
-                st.session_state.daily_questions = pick_resp.json()
+                payload = safe_json(pick_resp) or {}
+                st.session_state.daily_questions = payload.get("questions", [])
             elif pick_resp is not None:
-                st.error(pick_resp.json().get("detail", "Unable to load daily questions."))
+                show_response_error(pick_resp, "/questions/next", "Unable to load daily questions.")
 
         daily_questions = st.session_state.daily_questions or []
+        if st.session_state.daily_questions is None:
+            st.info("Load daily questions to begin.")
+        elif not daily_questions:
+            label = "Done for selected date" if override_daily_dt else "Done for today"
+            st.success(label)
         if daily_questions:
             with st.form("daily_form"):
                 daily_answers = []
                 daily_answer_map = {}
                 for question in daily_questions:
-                    slug = question["slug"]
-                    if slug in {"daily_mood", "daily_anxiety"}:
-                        value = st.slider(question["text"], 1, 10, 5, key=f"daily_{question['id']}")
+                    slug = question.get("slug") or ""
+                    category = (question.get("category") or "").lower()
+                    if category in {"mood", "anxiety"}:
+                        value = st.slider(question["text"], 0, 10, 5, key=f"daily_{question['id']}")
                         answer_text = str(value)
-                    elif slug in {"daily_hopeless", "daily_isolation"}:
-                        choice = st.selectbox(question["text"], ["No", "Sometimes", "Yes"], key=f"daily_{question['id']}")
-                        answer_text = choice
+                    elif category == "sleep":
+                        value = st.slider(question["text"], 0, 12, 7, key=f"daily_{question['id']}")
+                        answer_text = str(value)
                     else:
                         answer_text = st.text_input(question["text"], key=f"daily_{question['id']}")
                     daily_answers.append({
@@ -528,7 +541,8 @@ with daily_tab:
                         "answer_text": answer_text,
                         "entry_date": selected_checkin_date.isoformat(),
                     })
-                    daily_answer_map[slug] = answer_text
+                    if slug:
+                        daily_answer_map[slug] = answer_text
                 if st.form_submit_button("Save daily answers"):
                     payload = {"answers": daily_answers}
                     if override_daily_dt:
@@ -541,7 +555,13 @@ with daily_tab:
                             st.info("You can edit your answers and resubmit.")
                         else:
                             st.success("Daily check-in saved.")
-                            st.session_state.daily_questions = None
+                            refresh_resp = api_get(questions_path)
+                            if refresh_resp is not None and refresh_resp.ok:
+                                refreshed = safe_json(refresh_resp) or {}
+                                st.session_state.daily_questions = refreshed.get("questions", [])
+                            if not st.session_state.daily_questions:
+                                label = "Done for selected date" if override_daily_dt else "Done for today"
+                                st.success(label)
                         if st.session_state.show_quality_details:
                             st.caption(
                                 f"Quality score: {payload.get('input_quality_score')} | "
