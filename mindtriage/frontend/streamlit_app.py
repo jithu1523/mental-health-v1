@@ -455,15 +455,6 @@ with care_tab:
                     for item in plan.get("resources", []):
                         st.write(f"- {item.get('label')} ({item.get('type')}): {item.get('note')}")
                 st.caption(plan.get("safety_note", ""))
-                if st.button("Save plan to journal (optional)", key="save_plan_regular"):
-                    summary_lines = [item.get("title") for item in plan.get("next_15_min", [])]
-                    summary_lines += [item.get("title") for item in plan.get("next_24_hours", [])]
-                    summary = "Action plan: " + "; ".join(filter(None, summary_lines))
-                    resp = api_post("/journal", json={"content": summary})
-                    if resp is not None and resp.ok:
-                        st.success("Plan saved to journal.")
-                    elif resp is not None:
-                        show_response_error(resp, "/journal", "Unable to save plan.")
         else:
             st.info("Complete a daily check-in to generate an action plan.")
 
@@ -677,15 +668,6 @@ with rapid_tab:
                     for item in plan.get("resources", []):
                         st.write(f"- {item.get('label')} ({item.get('type')}): {item.get('note')}")
                 st.caption(plan.get("safety_note", ""))
-                if st.button("Save plan to journal (optional)", key="save_plan_rapid"):
-                    summary_lines = [item.get("title") for item in plan.get("next_15_min", [])]
-                    summary_lines += [item.get("title") for item in plan.get("next_24_hours", [])]
-                    summary = "Action plan: " + "; ".join(filter(None, summary_lines))
-                    resp = api_post("/journal", json={"content": summary})
-                    if resp is not None and resp.ok:
-                        st.success("Plan saved to journal.")
-                    elif resp is not None:
-                        show_response_error(resp, "/journal", "Unable to save plan.")
             actions = result.get("recommended_actions", [])
             if actions:
                 st.write("Next 15 minutes:")
