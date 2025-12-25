@@ -129,3 +129,34 @@ Mac/Linux:
 cd mindtriage/backend
 pytest -q
 ```
+## Run locally (Windows PowerShell)
+
+```powershell
+.\scripts\run_backend.ps1
+.\scripts\run_frontend.ps1
+```
+
+Or launch both:
+```powershell
+.\scripts\run_all.ps1
+```
+
+## Run locally (Manual)
+
+Backend:
+```powershell
+cd mindtriage\backend
+python -m venv .venv
+.\.venv\Scripts\activate
+pip install -r requirements.txt
+uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+```
+
+Frontend:
+```powershell
+cd mindtriage\frontend
+python -m venv .venv
+.\.venv\Scripts\activate
+pip install -r requirements.txt
+streamlit run streamlit_app.py --server.port 8501
+```
