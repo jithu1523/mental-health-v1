@@ -231,6 +231,48 @@ with care_tab:
                     elif resp is not None:
                         st.error(resp.json().get("detail", "Unable to save daily answers."))
 
+        st.subheader("Quick check-in (10 seconds)")
+        micro_resp = api_get("/micro/today")
+        if micro_resp is not None and micro_resp.ok:
+            micro = safe_json(micro_resp) or {}
+            question = micro.get("question")
+            answered = micro.get("answered")
+            if not question:
+                st.info("No micro check-in available.")
+            elif answered:
+                st.success("Done for today ✅")
+            else:
+                with st.form("micro_form"):
+                    prompt = question.get("prompt", "Quick check-in")
+                    qtype = question.get("question_type")
+                    options = question.get("options", [])
+                    if qtype == "scale":
+                        value = st.slider(prompt, 1, 5, 3)
+                        answer_value = str(value)
+                    else:
+                        answer_value = st.selectbox(prompt, options)
+                    if st.form_submit_button("Save quick check-in"):
+                        payload = {
+                            "question_id": question.get("id"),
+                            "value": answer_value,
+                        }
+                        resp = api_post("/micro/answer", json=payload)
+                        if resp is not None and resp.ok:
+                            st.success("Quick check-in saved.")
+                        elif resp is not None:
+                            show_response_error(resp, "/micro/answer", "Unable to save quick check-in.")
+        elif micro_resp is not None:
+            show_response_error(micro_resp, "/micro/today", "Unable to load quick check-in.")
+
+        history_resp = api_get("/micro/history?days=7")
+        if history_resp is not None and history_resp.ok:
+            history = safe_json(history_resp) or []
+            if history:
+                st.caption("Last 7 days")
+                st.write(", ".join(f\"{item['entry_date']}: {item['value']}\" for item in history))
+        elif history_resp is not None:
+            show_response_error(history_resp, "/micro/history", "Unable to load quick check-in history.")
+
         profile = status.get("profile", {})
         total_questions = profile.get("total_questions", 0)
         answered = profile.get("answered", 0)

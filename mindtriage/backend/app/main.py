@@ -18,7 +18,7 @@ from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel
-from sqlalchemy import Boolean, Column, Date, DateTime, Float, ForeignKey, Integer, String, create_engine, func, text, or_
+from sqlalchemy import Boolean, Column, Date, DateTime, Float, ForeignKey, Integer, String, UniqueConstraint, create_engine, func, text, or_
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import Session, relationship, sessionmaker
 
@@ -124,6 +124,32 @@ class UserBaseline(Base):
     user = relationship("User", back_populates="baseline")
 
 
+class MicroQuestion(Base):
+    __tablename__ = "micro_questions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    prompt = Column(String, nullable=False)
+    question_type = Column(String, nullable=False)
+    options_json = Column(String, nullable=False, default="[]")
+    category = Column(String, nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False)
+
+
+class MicroAnswer(Base):
+    __tablename__ = "micro_answers"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    question_id = Column(Integer, ForeignKey("micro_questions.id"), nullable=False)
+    entry_date = Column(Date, default=date.today, nullable=False)
+    value_json = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "entry_date", name="uq_micro_user_date"),
+    )
+
+
 class Question(Base):
     __tablename__ = "questions"
 
@@ -215,6 +241,20 @@ class OnboardingAnswerCreate(BaseModel):
 
 class OnboardingAnswerBatch(BaseModel):
     answers: List[OnboardingAnswerCreate]
+
+
+class MicroQuestionResponse(BaseModel):
+    id: int
+    prompt: str
+    question_type: str
+    options: List[str]
+    category: str
+
+
+class MicroAnswerCreate(BaseModel):
+    question_id: int
+    value: str
+    entry_date: Optional[date] = None
 
 
 class RapidQuestion(BaseModel):
@@ -366,6 +406,39 @@ ONBOARDING_PROFILE_QUESTIONS = [
     },
 ]
 
+MICRO_QUESTIONS = [
+    {
+        "prompt": "How is your mood right now?",
+        "question_type": "scale",
+        "options": [str(i) for i in range(1, 6)],
+        "category": "mood",
+    },
+    {
+        "prompt": "How stressed do you feel right now?",
+        "question_type": "scale",
+        "options": [str(i) for i in range(1, 6)],
+        "category": "stress",
+    },
+    {
+        "prompt": "Did you take a short pause or break today?",
+        "question_type": "choice",
+        "options": ["Yes", "No"],
+        "category": "recovery",
+    },
+    {
+        "prompt": "How connected do you feel today?",
+        "question_type": "choice",
+        "options": ["Connected", "Neutral", "Isolated"],
+        "category": "connection",
+    },
+    {
+        "prompt": "How is your energy right now?",
+        "question_type": "scale",
+        "options": [str(i) for i in range(1, 6)],
+        "category": "energy",
+    },
+]
+
 RAPID_QUESTIONS = [
     {
         "id": 1,
@@ -458,6 +531,7 @@ def on_startup() -> None:
     ensure_onboarding_tables()
     seed_questions()
     seed_onboarding_profile_questions()
+    seed_micro_questions()
 
 
 def seed_questions() -> None:
@@ -491,6 +565,27 @@ def seed_onboarding_profile_questions() -> None:
                     options_json=json.dumps(item["options"]),
                     category=item["category"],
                     weight=item["weight"],
+                    is_active=True,
+                ))
+        if to_add:
+            session.add_all(to_add)
+            session.commit()
+    finally:
+        session.close()
+
+
+def seed_micro_questions() -> None:
+    session = SessionLocal()
+    try:
+        existing = {q.prompt for q in session.query(MicroQuestion).all()}
+        to_add = []
+        for item in MICRO_QUESTIONS:
+            if item["prompt"] not in existing:
+                to_add.append(MicroQuestion(
+                    prompt=item["prompt"],
+                    question_type=item["question_type"],
+                    options_json=json.dumps(item["options"]),
+                    category=item["category"],
                     is_active=True,
                 ))
         if to_add:
@@ -789,6 +884,130 @@ def onboarding_answer(
 
     db.commit()
     return {"saved": saved}
+
+
+@app.get("/micro/today")
+def micro_today(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    today = date.today()
+    questions = (
+        db.query(MicroQuestion)
+        .filter(MicroQuestion.is_active.is_(True))
+        .order_by(MicroQuestion.id.asc())
+        .all()
+    )
+    if not questions:
+        return {"question": None, "answered": False}
+
+    question = pick_micro_question_for_date(today, questions)
+    answered = (
+        db.query(MicroAnswer)
+        .filter(
+            MicroAnswer.user_id == user.id,
+            MicroAnswer.entry_date == today,
+        )
+        .first()
+    )
+    return {
+        "question": {
+            "id": question.id,
+            "prompt": question.prompt,
+            "question_type": question.question_type,
+            "options": json.loads(question.options_json),
+            "category": question.category,
+        },
+        "answered": answered is not None,
+    }
+
+
+@app.post("/micro/answer")
+def micro_answer(
+    payload: MicroAnswerCreate,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    today = date.today()
+    entry_date = payload.entry_date or today
+    if not is_dev_mode():
+        if payload.entry_date and payload.entry_date != today:
+            raise HTTPException(
+                status_code=400,
+                detail="entry_date must be today unless dev mode is enabled.",
+            )
+        entry_date = today
+
+    question = (
+        db.query(MicroQuestion)
+        .filter(MicroQuestion.id == payload.question_id, MicroQuestion.is_active.is_(True))
+        .first()
+    )
+    if not question:
+        raise HTTPException(status_code=400, detail="Unknown micro question.")
+
+    existing = (
+        db.query(MicroAnswer)
+        .filter(MicroAnswer.user_id == user.id, MicroAnswer.entry_date == entry_date)
+        .first()
+    )
+    if existing and not is_dev_mode():
+        raise HTTPException(status_code=400, detail="Micro check-in already completed for today.")
+
+    value = payload.value.strip()
+    if question.question_type == "scale":
+        if value not in json.loads(question.options_json):
+            raise HTTPException(status_code=400, detail="Invalid scale value.")
+    elif question.question_type == "choice":
+        if value not in json.loads(question.options_json):
+            raise HTTPException(status_code=400, detail="Invalid choice value.")
+    else:
+        raise HTTPException(status_code=400, detail="Unknown micro question type.")
+
+    if existing:
+        existing.question_id = question.id
+        existing.value_json = json.dumps({"value": value})
+        existing.created_at = datetime.utcnow()
+    else:
+        db.add(MicroAnswer(
+            user_id=user.id,
+            question_id=question.id,
+            entry_date=entry_date,
+            value_json=json.dumps({"value": value}),
+        ))
+    db.commit()
+    update_user_baseline(user.id, db)
+    return {"saved": True}
+
+
+@app.get("/micro/history")
+def micro_history(
+    days: int = Query(30, ge=1, le=365),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> List[dict]:
+    start_date = date.today() - timedelta(days=days - 1)
+    rows = (
+        db.query(MicroAnswer, MicroQuestion)
+        .join(MicroQuestion, MicroAnswer.question_id == MicroQuestion.id)
+        .filter(
+            MicroAnswer.user_id == user.id,
+            MicroAnswer.entry_date >= start_date,
+        )
+        .order_by(MicroAnswer.entry_date.asc())
+        .all()
+    )
+    history = []
+    for answer, question in rows:
+        value = json.loads(answer.value_json).get("value")
+        history.append({
+            "entry_date": answer.entry_date.isoformat(),
+            "prompt": question.prompt,
+            "category": question.category,
+            "value": value,
+            "question_type": question.question_type,
+        })
+    return history
 
 
 def is_recent_mood_or_anxiety_low(user_id: int, db: Session) -> bool:
@@ -1216,6 +1435,7 @@ def rapid_submit(
     quality_flags = list(dict.fromkeys(invalid_flags + soft_flags))
     is_valid = len(invalid_flags) == 0
     confidence_score = compute_rapid_confidence_score(time_taken_seconds, quality_flags)
+    confidence_score = apply_micro_confidence_bonus(user.id, db, confidence_score)
 
     explanations_sorted = sorted(explanations, key=lambda item: item.weight, reverse=True)
     top_explanations = explanations_sorted[:3]
@@ -2165,6 +2385,28 @@ def compute_trend_slope(scores_by_day: dict[date, int], lookback_days: int) -> f
     if denominator == 0:
         return 0.0
     return numerator / denominator
+
+
+def pick_micro_question_for_date(target_date: date, questions: List[MicroQuestion]) -> MicroQuestion:
+    index = target_date.toordinal() % len(questions)
+    return questions[index]
+
+
+def apply_micro_confidence_bonus(user_id: int, db: Session, confidence_score: float) -> float:
+    if confidence_score >= 0.95:
+        return confidence_score
+    start_date = date.today() - timedelta(days=6)
+    count = (
+        db.query(MicroAnswer)
+        .filter(
+            MicroAnswer.user_id == user_id,
+            MicroAnswer.entry_date >= start_date,
+        )
+        .count()
+    )
+    if count >= 5:
+        return min(0.95, confidence_score + 0.03)
+    return confidence_score
 
 
 def update_user_baseline(user_id: int, db: Session, lookback_days: int = 30) -> Optional[UserBaseline]:
