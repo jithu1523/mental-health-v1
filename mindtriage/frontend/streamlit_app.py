@@ -1,4 +1,5 @@
 from datetime import date, datetime
+import time
 
 import altair as alt
 import pandas as pd
@@ -33,6 +34,20 @@ if "micro_answered_last_7" not in st.session_state:
     st.session_state.micro_answered_last_7 = 0
 if "baseline_insights" not in st.session_state:
     st.session_state.baseline_insights = None
+if "eval_daily" not in st.session_state:
+    st.session_state.eval_daily = None
+if "eval_daily_followups" not in st.session_state:
+    st.session_state.eval_daily_followups = []
+if "eval_daily_session_id" not in st.session_state:
+    st.session_state.eval_daily_session_id = None
+if "eval_rapid" not in st.session_state:
+    st.session_state.eval_rapid = None
+if "eval_rapid_followups" not in st.session_state:
+    st.session_state.eval_rapid_followups = []
+if "eval_rapid_session_id" not in st.session_state:
+    st.session_state.eval_rapid_session_id = None
+if "rapid_started_ts" not in st.session_state:
+    st.session_state.rapid_started_ts = None
 
 
 def api_headers() -> dict:
@@ -295,6 +310,7 @@ with checkin_tab:
         if daily_questions:
             with st.form("daily_form"):
                 daily_answers = []
+                daily_answer_map = {}
                 for question in daily_questions:
                     slug = question["slug"]
                     if slug in {"daily_mood", "daily_anxiety"}:
@@ -310,6 +326,7 @@ with checkin_tab:
                         "answer_text": answer_text,
                         "entry_date": selected_checkin_date.isoformat(),
                     })
+                    daily_answer_map[slug] = answer_text
                 if st.form_submit_button("Save daily answers"):
                     payload = {"answers": daily_answers}
                     if override_daily_dt:
@@ -328,6 +345,17 @@ with checkin_tab:
                             )
                         st.session_state.daily_questions = None
                         st.session_state.micro_signal = payload.get("micro_signal")
+                        eval_payload = {
+                            "daily_answers": daily_answer_map,
+                        }
+                        eval_resp = api_post("/evaluate", json=eval_payload)
+                        if eval_resp is not None and eval_resp.ok:
+                            eval_data = safe_json(eval_resp) or {}
+                            st.session_state.eval_daily = eval_data
+                            st.session_state.eval_daily_followups = eval_data.get("recommended_followups", [])
+                            st.session_state.eval_daily_session_id = eval_data.get("session_id")
+                        elif eval_resp is not None:
+                            show_response_error(eval_resp, "/evaluate", "Unable to run evaluation.")
                     elif resp is not None:
                         st.error(resp.json().get("detail", "Unable to save daily answers."))
 
@@ -477,6 +505,42 @@ with checkin_tab:
                     )
                 elif resp is not None:
                     show_response_error(resp, "/dev/clear_demo", "Unable to clear demo data.")
+
+        if st.session_state.eval_daily_followups:
+            st.subheader("Quick follow-up")
+            with st.form("daily_followup_form"):
+                followup_answers = {}
+                for item in st.session_state.eval_daily_followups:
+                    answer = st.text_input(item["prompt"], key=f"daily_followup_{item['key']}")
+                    followup_answers[item["key"]] = answer
+                if st.form_submit_button("Submit follow-up"):
+                    resp = api_post(
+                        "/evaluate/followup",
+                        json={
+                            "session_id": st.session_state.eval_daily_session_id,
+                            "answers": followup_answers,
+                        },
+                    )
+                    if resp is not None and resp.ok:
+                        updated = safe_json(resp) or {}
+                        st.session_state.eval_daily = updated
+                        st.session_state.eval_daily_followups = []
+                        st.success("Thanks, follow-up saved.")
+                    elif resp is not None:
+                        show_response_error(resp, "/evaluate/followup", "Unable to submit follow-up.")
+
+        if st.session_state.eval_daily:
+            eval_result = st.session_state.eval_daily
+            st.subheader("Evaluation Summary")
+            st.write(f"Risk: {eval_result.get('risk_level')} | Score: {eval_result.get('risk_score')}")
+            quality = eval_result.get("quality", {})
+            if quality.get("is_suspected_fake"):
+                st.warning(f"Low quality: {quality.get('reason_summary', '')}. Try adding 1-2 sentences.")
+            elif st.session_state.show_quality_details:
+                st.caption(
+                    f"Quality score: {quality.get('quality_score')} | "
+                    f"Flags: {quality.get('flags')}"
+                )
 
         st.caption("Not a diagnosis. If you feel unsafe contact local emergency services.")
 
@@ -643,9 +707,11 @@ with insights_tab:
             start_payload = safe_json(start_resp) or {}
             st.session_state.rapid_session_id = start_payload.get("session_id")
             st.session_state.rapid_session_date = rapid_date.isoformat()
+            st.session_state.rapid_started_ts = time.time()
 
         with st.form("rapid_form"):
             rapid_answers = []
+            rapid_answer_map = {}
             for question in questions:
                 qid = question["id"]
                 qslug = question["slug"]
@@ -662,6 +728,7 @@ with insights_tab:
                 else:
                     answer_text = st.text_input(qtext, key=f"rapid_{qid}")
                 rapid_answers.append({"question_id": qid, "answer_text": answer_text})
+                rapid_answer_map[qslug] = answer_text
             if st.form_submit_button("Submit rapid evaluation"):
                 payload = {
                     "entry_date": rapid_date.isoformat(),
@@ -676,6 +743,21 @@ with insights_tab:
                     st.session_state.rapid_session_id = None
                     st.session_state.rapid_session_date = None
                     st.success("Rapid evaluation saved.")
+                    duration_seconds = None
+                    if st.session_state.rapid_started_ts:
+                        duration_seconds = time.time() - st.session_state.rapid_started_ts
+                    eval_payload = {
+                        "rapid_answers": rapid_answer_map,
+                        "duration_seconds": duration_seconds,
+                    }
+                    eval_resp = api_post("/evaluate", json=eval_payload)
+                    if eval_resp is not None and eval_resp.ok:
+                        eval_data = safe_json(eval_resp) or {}
+                        st.session_state.eval_rapid = eval_data
+                        st.session_state.eval_rapid_followups = eval_data.get("recommended_followups", [])
+                        st.session_state.eval_rapid_session_id = eval_data.get("session_id")
+                    elif eval_resp is not None:
+                        show_response_error(eval_resp, "/evaluate", "Unable to run evaluation.")
                 elif resp is not None:
                     if resp.status_code == 429:
                         detail = (safe_json(resp) or {}).get("detail", resp.text)
@@ -722,6 +804,42 @@ with insights_tab:
                     reason = item.get("reason", "Signal")
                     weight = item.get("weight", 0)
                     st.write(f"- {reason} (impact {weight})")
+
+        if st.session_state.eval_rapid_followups:
+            st.subheader("Quick follow-up")
+            with st.form("rapid_followup_form"):
+                followup_answers = {}
+                for item in st.session_state.eval_rapid_followups:
+                    answer = st.text_input(item["prompt"], key=f"rapid_followup_{item['key']}")
+                    followup_answers[item["key"]] = answer
+                if st.form_submit_button("Submit follow-up"):
+                    resp = api_post(
+                        "/evaluate/followup",
+                        json={
+                            "session_id": st.session_state.eval_rapid_session_id,
+                            "answers": followup_answers,
+                        },
+                    )
+                    if resp is not None and resp.ok:
+                        updated = safe_json(resp) or {}
+                        st.session_state.eval_rapid = updated
+                        st.session_state.eval_rapid_followups = []
+                        st.success("Thanks, follow-up saved.")
+                    elif resp is not None:
+                        show_response_error(resp, "/evaluate/followup", "Unable to submit follow-up.")
+
+        if st.session_state.eval_rapid:
+            eval_result = st.session_state.eval_rapid
+            st.subheader("Unified Evaluation")
+            st.write(f"Risk: {eval_result.get('risk_level')} | Score: {eval_result.get('risk_score')}")
+            quality = eval_result.get("quality", {})
+            if quality.get("is_suspected_fake"):
+                st.warning(f"Low quality: {quality.get('reason_summary', '')}. Try adding 1-2 sentences.")
+            elif st.session_state.show_quality_details:
+                st.caption(
+                    f"Quality score: {quality.get('quality_score')} | "
+                    f"Flags: {quality.get('flags')}"
+                )
 
             st.subheader("Action Plan")
             micro_signal = result.get("micro_signal", {})

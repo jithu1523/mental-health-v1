@@ -6,6 +6,7 @@ import json
 import os
 import random
 import re
+import uuid
 import zipfile
 from datetime import date, datetime, timedelta
 from hashlib import sha256
@@ -22,6 +23,8 @@ from pydantic import BaseModel
 from sqlalchemy import Boolean, Column, Date, DateTime, Float, ForeignKey, Integer, String, UniqueConstraint, create_engine, func, text, or_
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import Session, relationship, sessionmaker
+
+from mindtriage.backend.app.evaluation_engine import evaluate as run_evaluation
 
 DATABASE_URL = "sqlite:///./mindtriage.db"
 SECRET_KEY = "CHANGE_ME"
@@ -155,6 +158,29 @@ class MicroAnswer(Base):
     __table_args__ = (
         UniqueConstraint("user_id", "entry_date", name="uq_micro_user_date"),
     )
+
+
+class EvaluationSession(Base):
+    __tablename__ = "evaluation_sessions"
+
+    id = Column(String, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    inputs_json = Column(String, nullable=False)
+    result_json = Column(String, nullable=False)
+    followups_json = Column(String, nullable=False, default="[]")
+
+
+class EvaluationFollowup(Base):
+    __tablename__ = "evaluation_followups"
+
+    id = Column(Integer, primary_key=True, index=True)
+    session_id = Column(String, ForeignKey("evaluation_sessions.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    question_key = Column(String, nullable=False)
+    question_prompt = Column(String, nullable=False)
+    answer_text = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 
 class Question(Base):
@@ -298,6 +324,18 @@ class ActionPlanRequest(BaseModel):
     micro_streak_days: int = 0
     answered_last_7_days: int = 0
     self_harm_flag: bool = False
+
+
+class EvaluationRequest(BaseModel):
+    journal_text: Optional[str] = None
+    daily_answers: Optional[dict] = None
+    rapid_answers: Optional[dict] = None
+    duration_seconds: Optional[float] = None
+
+
+class EvaluationFollowupRequest(BaseModel):
+    session_id: str
+    answers: dict
 
 
 class RapidQuestion(BaseModel):
@@ -1157,6 +1195,124 @@ def plan_generate(payload: ActionPlanRequest) -> ActionPlanOutput:
         self_harm_flag=payload.self_harm_flag,
     )
     return ActionPlanOutput(**plan)
+
+
+@app.post("/evaluate")
+def evaluate_endpoint(
+    payload: EvaluationRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    result = run_evaluation(
+        journal_text=payload.journal_text,
+        daily_answers=payload.daily_answers,
+        rapid_answers=payload.rapid_answers,
+        duration_seconds=payload.duration_seconds,
+    )
+    session_id = uuid.uuid4().hex
+    session = EvaluationSession(
+        id=session_id,
+        user_id=user.id,
+        inputs_json=json.dumps({
+            "journal_text": payload.journal_text,
+            "daily_answers": payload.daily_answers,
+            "rapid_answers": payload.rapid_answers,
+            "duration_seconds": payload.duration_seconds,
+        }),
+        result_json=json.dumps({
+            "risk_score": result.risk_score,
+            "risk_level": result.risk_level,
+            "signals": result.signals,
+            "confidence": result.confidence,
+            "quality": {
+                "quality_score": result.quality.score,
+                "flags": result.quality.flags,
+                "is_suspected_fake": result.quality.is_suspected_fake,
+                "reason_summary": result.quality.reason_summary,
+            },
+        }),
+        followups_json=json.dumps(result.recommended_followups),
+    )
+    db.add(session)
+    db.commit()
+    return {
+        "session_id": session_id,
+        "risk_score": result.risk_score,
+        "risk_level": result.risk_level,
+        "signals": result.signals,
+        "confidence": result.confidence,
+        "quality": {
+            "quality_score": result.quality.score,
+            "flags": result.quality.flags,
+            "is_suspected_fake": result.quality.is_suspected_fake,
+            "reason_summary": result.quality.reason_summary,
+        },
+        "recommended_followups": result.recommended_followups,
+    }
+
+
+@app.post("/evaluate/followup")
+def evaluate_followup_endpoint(
+    payload: EvaluationFollowupRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    session = (
+        db.query(EvaluationSession)
+        .filter(EvaluationSession.id == payload.session_id, EvaluationSession.user_id == user.id)
+        .first()
+    )
+    if not session:
+        raise HTTPException(status_code=400, detail="Unknown evaluation session.")
+
+    followups = json.loads(session.followups_json or "[]")
+    for key, answer in payload.answers.items():
+        question = next((q for q in followups if q["key"] == key), None)
+        if question:
+            db.add(EvaluationFollowup(
+                session_id=session.id,
+                user_id=user.id,
+                question_key=key,
+                question_prompt=question["prompt"],
+                answer_text=str(answer),
+            ))
+    db.commit()
+
+    inputs = json.loads(session.inputs_json)
+    result = run_evaluation(
+        journal_text=inputs.get("journal_text"),
+        daily_answers=inputs.get("daily_answers"),
+        rapid_answers=inputs.get("rapid_answers"),
+        duration_seconds=inputs.get("duration_seconds"),
+        followup_answers=payload.answers,
+    )
+    session.result_json = json.dumps({
+        "risk_score": result.risk_score,
+        "risk_level": result.risk_level,
+        "signals": result.signals,
+        "confidence": result.confidence,
+        "quality": {
+            "quality_score": result.quality.score,
+            "flags": result.quality.flags,
+            "is_suspected_fake": result.quality.is_suspected_fake,
+            "reason_summary": result.quality.reason_summary,
+        },
+    })
+    session.followups_json = json.dumps([])
+    db.commit()
+    return {
+        "risk_score": result.risk_score,
+        "risk_level": result.risk_level,
+        "signals": result.signals,
+        "confidence": result.confidence,
+        "quality": {
+            "quality_score": result.quality.score,
+            "flags": result.quality.flags,
+            "is_suspected_fake": result.quality.is_suspected_fake,
+            "reason_summary": result.quality.reason_summary,
+        },
+        "recommended_followups": [],
+    }
 
 
 def is_recent_mood_or_anxiety_low(user_id: int, db: Session) -> bool:
