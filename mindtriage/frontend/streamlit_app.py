@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime
 
 import altair as alt
 import pandas as pd
