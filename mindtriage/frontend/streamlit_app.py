@@ -358,9 +358,26 @@ with care_tab:
                     json={"content": journal_text, "entry_date": selected_journal_date.isoformat()},
                 )
                 if resp is not None and resp.ok:
-                    st.success("Journal entry saved.")
+                    payload = safe_json(resp) or {}
+                    if payload.get("is_low_quality"):
+                        st.warning(f"Low quality: {payload.get('reason_summary', '')}. Try adding 1–2 sentences.")
+                    else:
+                        st.success("Journal entry saved.")
+                    if st.session_state.dev_mode:
+                        st.caption(
+                            f"Quality score: {payload.get('input_quality_score')} | "
+                            f"Flags: {payload.get('input_quality_flags')}"
+                        )
                 elif resp is not None:
-                    st.error(resp.json().get("detail", "Unable to save journal."))
+                    if resp.status_code == 429:
+                        retry_after = resp.headers.get("Retry-After")
+                        detail = (safe_json(resp) or {}).get("detail", resp.text)
+                        if retry_after:
+                            st.warning(f"{detail} Retry after {retry_after} seconds.")
+                        else:
+                            st.warning(detail)
+                    else:
+                        show_response_error(resp, "/journal", "Unable to save journal.")
 
         journal_resp = api_get("/journal")
         if journal_resp is not None and journal_resp.ok:
@@ -622,6 +639,13 @@ with rapid_tab:
                 st.write(f"Confidence: {confidence_label}")
                 if confidence_label == "Low":
                     st.info("Confidence is low because your answers were too quick/inconsistent. You can retake slowly.")
+            if result.get("is_low_quality"):
+                st.warning(f"Low quality: {result.get('reason_summary', '')}. Try adding 1–2 sentences.")
+            if st.session_state.dev_mode:
+                st.caption(
+                    f"Quality score: {result.get('input_quality_score')} | "
+                    f"Flags: {result.get('input_quality_flags')}"
+                )
             if result.get("is_valid") is False:
                 flags = result.get("quality_flags", [])
                 flag_text = ", ".join(flags) if flags else "quality flags"

@@ -5,6 +5,7 @@ import io
 import json
 import os
 import random
+import re
 import zipfile
 from datetime import date, datetime, timedelta
 from hashlib import sha256
@@ -59,6 +60,9 @@ class JournalEntry(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     entry_date = Column(Date, default=date.today, nullable=True)
     is_demo = Column(Boolean, default=False, nullable=False)
+    input_quality_score = Column(Integer, nullable=True)
+    input_quality_flags_json = Column(String, nullable=False, default="[]")
+    is_low_quality = Column(Boolean, default=False, nullable=False)
 
     user = relationship("User", back_populates="journal_entries")
 
@@ -82,6 +86,9 @@ class RapidEvaluation(Base):
     is_valid = Column(Boolean, default=True, nullable=False)
     quality_flags_json = Column(String, nullable=False, default="[]")
     is_demo = Column(Boolean, default=False, nullable=False)
+    input_quality_score = Column(Integer, nullable=True)
+    input_quality_flags_json = Column(String, nullable=False, default="[]")
+    is_low_quality = Column(Boolean, default=False, nullable=False)
 
 
 class OnboardingQuestion(Base):
@@ -211,6 +218,10 @@ class JournalResponse(BaseModel):
     id: int
     content: str
     created_at: datetime
+    input_quality_score: Optional[int] = None
+    input_quality_flags: Optional[List[str]] = None
+    is_low_quality: Optional[bool] = None
+    reason_summary: Optional[str] = None
 
 
 class RiskResponse(BaseModel):
@@ -326,6 +337,10 @@ class RapidSubmitResponse(BaseModel):
     time_taken_seconds: float
     micro_signal: dict
     entry_date: str
+    input_quality_score: Optional[int] = None
+    input_quality_flags: Optional[List[str]] = None
+    is_low_quality: Optional[bool] = None
+    reason_summary: Optional[str] = None
 
 
 class RapidStartRequest(BaseModel):
@@ -559,6 +574,7 @@ def on_startup() -> None:
     ensure_entry_date_columns()
     ensure_rapid_columns()
     ensure_onboarding_tables()
+    ensure_quality_columns()
     seed_questions()
     seed_onboarding_profile_questions()
     seed_micro_questions()
@@ -661,6 +677,26 @@ def ensure_rapid_columns() -> None:
             if "is_demo" not in columns:
                 connection.execute(text("ALTER TABLE rapid_evaluations ADD COLUMN is_demo BOOLEAN DEFAULT 0"))
             connection.commit()
+
+
+def ensure_quality_columns() -> None:
+    with engine.connect() as connection:
+        journal_columns = {row[1] for row in connection.execute(text("PRAGMA table_info(journal_entries)"))}
+        if "input_quality_score" not in journal_columns:
+            connection.execute(text("ALTER TABLE journal_entries ADD COLUMN input_quality_score INTEGER"))
+        if "input_quality_flags_json" not in journal_columns:
+            connection.execute(text("ALTER TABLE journal_entries ADD COLUMN input_quality_flags_json TEXT DEFAULT '[]'"))
+        if "is_low_quality" not in journal_columns:
+            connection.execute(text("ALTER TABLE journal_entries ADD COLUMN is_low_quality BOOLEAN DEFAULT 0"))
+
+        rapid_columns = {row[1] for row in connection.execute(text("PRAGMA table_info(rapid_evaluations)"))}
+        if "input_quality_score" not in rapid_columns:
+            connection.execute(text("ALTER TABLE rapid_evaluations ADD COLUMN input_quality_score INTEGER"))
+        if "input_quality_flags_json" not in rapid_columns:
+            connection.execute(text("ALTER TABLE rapid_evaluations ADD COLUMN input_quality_flags_json TEXT DEFAULT '[]'"))
+        if "is_low_quality" not in rapid_columns:
+            connection.execute(text("ALTER TABLE rapid_evaluations ADD COLUMN is_low_quality BOOLEAN DEFAULT 0"))
+        connection.commit()
 
 
 def get_db() -> Session:
@@ -1205,6 +1241,25 @@ def create_journal_entry(
     content = payload.content.strip()
     if not content:
         raise HTTPException(status_code=400, detail="Journal content cannot be empty")
+    cutoff = datetime.utcnow() - timedelta(hours=1)
+    recent_count = (
+        db.query(JournalEntry)
+        .filter(JournalEntry.user_id == user.id, JournalEntry.created_at >= cutoff)
+        .count()
+    )
+    if recent_count >= 10:
+        oldest = (
+            db.query(JournalEntry)
+            .filter(JournalEntry.user_id == user.id, JournalEntry.created_at >= cutoff)
+            .order_by(JournalEntry.created_at.asc())
+            .first()
+        )
+        retry_after = calculate_retry_after(oldest.created_at if oldest else None)
+        raise HTTPException(
+            status_code=429,
+            detail="Journal rate limit reached (10 per hour). Please try again later.",
+            headers={"Retry-After": str(retry_after)},
+        )
     today = date.today()
     entry_date = payload.entry_date or today
     if not is_dev_mode():
@@ -1214,12 +1269,44 @@ def create_journal_entry(
                 detail="entry_date must be today unless dev mode is enabled.",
             )
         entry_date = today
-    entry = JournalEntry(user_id=user.id, content=content, entry_date=entry_date)
+    recent_texts = [
+        item.content
+        for item in db.query(JournalEntry)
+        .filter(JournalEntry.user_id == user.id)
+        .order_by(JournalEntry.created_at.desc())
+        .limit(3)
+        .all()
+    ]
+    short_window_count = (
+        db.query(JournalEntry)
+        .filter(
+            JournalEntry.user_id == user.id,
+            JournalEntry.created_at >= datetime.utcnow() - timedelta(minutes=10),
+        )
+        .count()
+    )
+    quality = assess_input_quality(content, recent_texts, short_window_count)
+    entry = JournalEntry(
+        user_id=user.id,
+        content=content,
+        entry_date=entry_date,
+        input_quality_score=quality["quality_score"],
+        input_quality_flags_json=json.dumps(quality["flags"]),
+        is_low_quality=quality["is_low_quality"],
+    )
     db.add(entry)
     db.commit()
     db.refresh(entry)
     update_user_baseline(user.id, db)
-    return JournalResponse(id=entry.id, content=entry.content, created_at=entry.created_at)
+    return JournalResponse(
+        id=entry.id,
+        content=entry.content,
+        created_at=entry.created_at,
+        input_quality_score=entry.input_quality_score,
+        input_quality_flags=quality["flags"],
+        is_low_quality=entry.is_low_quality,
+        reason_summary=quality["reason_summary"],
+    )
 
 
 @app.get("/journal", response_model=List[JournalResponse])
@@ -1254,6 +1341,7 @@ def risk_latest(
     last_journal = (
         db.query(JournalEntry)
         .filter(JournalEntry.user_id == user.id)
+        .filter(JournalEntry.is_low_quality.is_(False))
         .order_by(JournalEntry.created_at.desc())
         .first()
     )
@@ -1293,6 +1381,7 @@ def risk_history(
             JournalEntry.user_id == user.id,
             JournalEntry.entry_date.isnot(None),
             JournalEntry.entry_date >= start_date,
+            JournalEntry.is_low_quality.is_(False),
         )
         .order_by(JournalEntry.entry_date.asc(), JournalEntry.created_at.desc())
         .all()
@@ -1531,6 +1620,25 @@ def rapid_submit(
     if last_valid and last_valid.answers_json == answers_payload:
         invalid_flags.append("duplicate_answers")
 
+    recent_inputs = [
+        item.answers_json
+        for item in db.query(RapidEvaluation)
+        .filter(RapidEvaluation.user_id == user.id, RapidEvaluation.submitted_at.isnot(None))
+        .order_by(RapidEvaluation.submitted_at.desc())
+        .limit(3)
+        .all()
+    ]
+    short_window_count = (
+        db.query(RapidEvaluation)
+        .filter(
+            RapidEvaluation.user_id == user.id,
+            RapidEvaluation.submitted_at.isnot(None),
+            RapidEvaluation.submitted_at >= datetime.utcnow() - timedelta(minutes=10),
+        )
+        .count()
+    )
+    quality = assess_input_quality(" ".join(answers_by_slug.values()), recent_inputs, short_window_count)
+
     soft_flags: List[str] = []
     if detect_patterned_answers(answers_by_slug):
         soft_flags.append("patterned_answers")
@@ -1556,6 +1664,9 @@ def rapid_submit(
         active_session.level = level
         active_session.signals_json = json.dumps(signals)
         active_session.confidence_score = confidence_score
+        active_session.input_quality_score = quality["quality_score"]
+        active_session.input_quality_flags_json = json.dumps(quality["flags"])
+        active_session.is_low_quality = quality["is_low_quality"]
         active_session.explainability_json = json.dumps([item.model_dump() for item in top_explanations])
         active_session.time_taken_seconds = time_taken_seconds
         active_session.is_valid = is_valid
@@ -1571,6 +1682,9 @@ def rapid_submit(
             level=level,
             signals_json=json.dumps(signals),
             confidence_score=confidence_score,
+            input_quality_score=quality["quality_score"],
+            input_quality_flags_json=json.dumps(quality["flags"]),
+            is_low_quality=quality["is_low_quality"],
             explainability_json=json.dumps([item.model_dump() for item in top_explanations]),
             time_taken_seconds=time_taken_seconds,
             is_valid=is_valid,
@@ -1592,6 +1706,10 @@ def rapid_submit(
         quality_flags=quality_flags,
         time_taken_seconds=time_taken_seconds,
         micro_signal=micro_signal,
+        input_quality_score=quality["quality_score"],
+        input_quality_flags=quality["flags"],
+        is_low_quality=quality["is_low_quality"],
+        reason_summary=quality["reason_summary"],
         entry_date=entry_date.isoformat(),
     )
 
@@ -2664,6 +2782,82 @@ def build_action_plan(
         "resources": resources[:3],
         "safety_note": safety_note,
     }
+
+
+def assess_input_quality(text: str, recent_texts: List[str], short_window_count: int) -> dict:
+    flags: List[str] = []
+    cleaned = text.strip()
+    lowered = cleaned.lower()
+    tokens = re.findall(r"\b\w+\b", lowered)
+    word_count = len(tokens)
+
+    if len(cleaned) < 30:
+        flags.append("too_short")
+    if word_count < 5:
+        flags.append("low_word_count")
+    if re.search(r"(.)\1{4,}", lowered):
+        flags.append("repeated_characters")
+    if re.search(r"[bcdfghjklmnpqrstvwxyz]{5,}", lowered):
+        flags.append("keyboard_smash")
+    if tokens:
+        unique_ratio = len(set(tokens)) / len(tokens)
+        if unique_ratio < 0.5:
+            flags.append("repeated_tokens")
+    profanity = {"fuck", "shit", "bitch", "asshole", "damn", "cunt"}
+    if tokens and all(token in profanity for token in tokens):
+        flags.append("profanity_only")
+    normalized_recent = [item.strip().lower() for item in recent_texts]
+    if normalized_recent and lowered in normalized_recent:
+        flags.append("duplicate_recent")
+    if short_window_count >= 4:
+        flags.append("rapid_submissions")
+
+    score = 100
+    deductions = {
+        "too_short": 15,
+        "low_word_count": 15,
+        "repeated_characters": 10,
+        "repeated_tokens": 10,
+        "keyboard_smash": 10,
+        "profanity_only": 20,
+        "duplicate_recent": 25,
+        "rapid_submissions": 10,
+    }
+    for flag in flags:
+        score -= deductions.get(flag, 0)
+    score = max(0, min(100, score))
+    is_low_quality = score < 60
+    reason_summary = summarize_quality_flags(flags)
+    return {
+        "quality_score": score,
+        "flags": flags,
+        "is_low_quality": is_low_quality,
+        "reason_summary": reason_summary,
+    }
+
+
+def summarize_quality_flags(flags: List[str]) -> str:
+    mapping = {
+        "too_short": "Too short",
+        "low_word_count": "Not enough words",
+        "repeated_characters": "Repeated characters",
+        "repeated_tokens": "Repetitive wording",
+        "keyboard_smash": "Looks like keyboard mash",
+        "profanity_only": "Profanity only",
+        "duplicate_recent": "Same as a recent entry",
+        "rapid_submissions": "Many submissions in a short time",
+    }
+    if not flags:
+        return "Looks good."
+    summary = [mapping.get(flag, flag) for flag in flags[:3]]
+    return "; ".join(summary)
+
+
+def calculate_retry_after(oldest_created_at: Optional[datetime]) -> int:
+    if not oldest_created_at:
+        return 3600
+    remaining = 3600 - (datetime.utcnow() - oldest_created_at).total_seconds()
+    return max(60, int(remaining))
 
 
 def update_user_baseline(user_id: int, db: Session, lookback_days: int = 30) -> Optional[UserBaseline]:
