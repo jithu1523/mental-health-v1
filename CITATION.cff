@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+title: MindTriage
+message: "If you use this project, please cite it."
+type: software
+version: 1.4.0
+date-released: 2025-12-25
+authors:
+  - family-names: Placeholder
+    given-names: Author
+    email: author@example.com

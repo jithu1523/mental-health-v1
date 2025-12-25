@@ -2,6 +2,23 @@
 
 Not a diagnosis. If you feel unsafe contact local emergency services.
 
+## Overview
+
+MindTriage is a local-first check-in tool that combines rapid triage, daily tracking,
+and journaling with quality gating and transparent, rule-based insights.
+
+## Screenshots (placeholder)
+
+- Add screenshots here.
+
+## Architecture (placeholder)
+
+```
+Streamlit UI
+  -> FastAPI API
+     -> SQLite (local)
+```
+
 ## Quick Start (Windows)
 
 ```powershell
@@ -52,7 +69,8 @@ Copy `.env.example` to `.env` in the repo root and edit as needed:
 
 ## Dev Mode
 
-Set env vars and use the query parameter to enable dev controls:
+Set env vars and use the query parameter to enable dev controls.
+Dev mode is locked behind the backend flag and a local-only secret:
 
 Windows PowerShell:
 ```powershell
@@ -70,6 +88,12 @@ Then open:
 ```
 http://localhost:8501/?dev=1&dev_key=local_only
 ```
+
+## Safety & Limitations
+
+- This tool does not provide medical advice or diagnosis.
+- Scoring is rule-based and conservative; false positives are possible.
+- If you feel unsafe, seek immediate help.
 
 ## Data & Privacy
 
