@@ -701,7 +701,11 @@ def seed_questions() -> None:
         to_add = []
         for item in ONBOARDING_QUESTIONS + DAILY_QUESTIONS:
             if item["slug"] not in existing:
-                to_add.append(Question(**item))
+                to_add.append(Question(
+                    kind=item["kind"],
+                    slug=item["slug"],
+                    text=item["text"],
+                ))
         if to_add:
             session.add_all(to_add)
             session.commit()
