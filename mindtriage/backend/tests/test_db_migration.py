@@ -20,7 +20,8 @@ def test_migrate_legacy_db_when_canonical_empty(tmp_path):
     legacy_conn.close()
 
     status = main.migrate_legacy_db(str(canonical), str(legacy))
-    assert status == "migrated"
+    assert status["status"] == "migrated"
+    assert status["migrated_rows"].get("users") == 1
 
     check_conn = sqlite3.connect(canonical)
     count = check_conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]

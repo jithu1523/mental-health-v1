@@ -59,17 +59,24 @@ def get_table_columns(connection: sqlite3.Connection, table: str) -> List[str]:
     return [row[1] for row in cursor.fetchall()]
 
 
-def migrate_legacy_db(canonical_path: str, legacy_path: str) -> str:
+def migrate_legacy_db(canonical_path: str, legacy_path: str) -> dict:
     canonical = Path(canonical_path)
     legacy = Path(legacy_path)
+    result = {
+        "status": "skipped",
+        "migrated_tables": [],
+        "migrated_rows": {},
+    }
     if not legacy.exists():
-        return "no_legacy"
+        result["status"] = "no_legacy"
+        return result
 
     if not canonical.exists():
         canonical.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(legacy, canonical)
         print(f"Copied legacy DB from {legacy} to {canonical}.")
-        return "copied_legacy"
+        result["status"] = "copied_legacy"
+        return result
 
     try:
         canonical_conn = sqlite3.connect(canonical)
@@ -77,12 +84,14 @@ def migrate_legacy_db(canonical_path: str, legacy_path: str) -> str:
         canonical_tables = set(get_sqlite_tables(canonical_conn))
         legacy_tables = set(get_sqlite_tables(legacy_conn))
         if "users" not in canonical_tables or "users" not in legacy_tables:
-            return "skipped"
+            result["status"] = "skipped"
+            return result
 
         canonical_users = canonical_conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
         legacy_users = legacy_conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        if canonical_users > 0 or legacy_users == 0:
-            return "skipped"
+        if legacy_users <= canonical_users:
+            result["status"] = "skipped"
+            return result
 
         common_tables = canonical_tables & legacy_tables
         migrated_tables = 0
@@ -99,17 +108,25 @@ def migrate_legacy_db(canonical_path: str, legacy_path: str) -> str:
             ).fetchall()
             if not rows:
                 continue
+            before_count = canonical_conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
             canonical_conn.executemany(
                 f"INSERT OR IGNORE INTO {table} ({column_list}) VALUES ({placeholders})",
                 rows,
             )
+            after_count = canonical_conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            delta = max(0, after_count - before_count)
+            if delta:
+                result["migrated_rows"][table] = delta
             migrated_tables += 1
         canonical_conn.commit()
         print(f"Migrated legacy DB rows from {legacy} into {canonical} ({migrated_tables} tables).")
-        return "migrated"
+        result["status"] = "migrated"
+        result["migrated_tables"] = sorted(result["migrated_rows"].keys())
+        return result
     except Exception as exc:
         print(f"Legacy migration skipped due to error: {exc}")
-        return "skipped"
+        result["status"] = "skipped"
+        return result
     finally:
         try:
             canonical_conn.close()
@@ -121,10 +138,10 @@ def migrate_legacy_db(canonical_path: str, legacy_path: str) -> str:
             pass
 
 
-def ensure_canonical_db() -> str:
+def ensure_canonical_db() -> dict:
     legacy = REPO_ROOT / "mindtriage" / "backend" / "mindtriage.db"
     status = migrate_legacy_db(DB_PATH, str(legacy))
-    if status == "skipped":
+    if status.get("status") == "skipped":
         canonical = Path(DB_PATH)
         if canonical.exists() and legacy.exists():
             print(f"Using canonical DB at {canonical}. Legacy DB still at {legacy}.")
@@ -132,7 +149,7 @@ def ensure_canonical_db() -> str:
 
 
 DB_PATH = resolve_db_path()
-MIGRATION_STATUS = ensure_canonical_db()
+MIGRATION_INFO = ensure_canonical_db()
 DATABASE_URL = f"sqlite:///{DB_PATH}"
 SECRET_KEY = "CHANGE_ME"
 EXPORT_SALT = "LOCAL_EXPORT_SALT_CHANGE_ME"
@@ -1082,7 +1099,9 @@ def meta() -> dict:
         "version": APP_VERSION,
         "dev_mode": is_dev_mode(),
         "db_path": DB_PATH,
-        "migration_status": MIGRATION_STATUS,
+        "migration_status": MIGRATION_INFO.get("status"),
+        "migrated_tables": MIGRATION_INFO.get("migrated_tables", []),
+        "migrated_rows": MIGRATION_INFO.get("migrated_rows", {}),
     }
 
 
