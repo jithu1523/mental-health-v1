@@ -87,15 +87,25 @@ def migrate_legacy_db(canonical_path: str, legacy_path: str) -> dict:
             result["status"] = "skipped"
             return result
 
-        canonical_users = canonical_conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        legacy_users = legacy_conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        if legacy_users <= canonical_users:
+        common_tables = canonical_tables & legacy_tables
+        should_migrate = False
+        table_counts: dict[str, tuple[int, int]] = {}
+        for table in sorted(common_tables):
+            canonical_count = canonical_conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            legacy_count = legacy_conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            table_counts[table] = (canonical_count, legacy_count)
+            if legacy_count > canonical_count:
+                should_migrate = True
+
+        if not should_migrate:
             result["status"] = "skipped"
             return result
 
-        common_tables = canonical_tables & legacy_tables
         migrated_tables = 0
         for table in sorted(common_tables):
+            canonical_count, legacy_count = table_counts.get(table, (0, 0))
+            if legacy_count <= canonical_count:
+                continue
             canonical_cols = set(get_table_columns(canonical_conn, table))
             legacy_cols = set(get_table_columns(legacy_conn, table))
             columns = sorted(canonical_cols & legacy_cols)
@@ -108,7 +118,7 @@ def migrate_legacy_db(canonical_path: str, legacy_path: str) -> dict:
             ).fetchall()
             if not rows:
                 continue
-            before_count = canonical_conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            before_count = canonical_count
             canonical_conn.executemany(
                 f"INSERT OR IGNORE INTO {table} ({column_list}) VALUES ({placeholders})",
                 rows,
