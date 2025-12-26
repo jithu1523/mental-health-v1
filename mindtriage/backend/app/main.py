@@ -7,6 +7,7 @@ import os
 import random
 import re
 import shutil
+import sqlite3
 import uuid
 import zipfile
 from datetime import date, datetime, timedelta
@@ -48,20 +49,90 @@ def resolve_db_path() -> str:
     return str(db_path)
 
 
-def maybe_copy_legacy_db(canonical_path: str) -> None:
+def get_sqlite_tables(connection: sqlite3.Connection) -> List[str]:
+    cursor = connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    return [row[0] for row in cursor.fetchall()]
+
+
+def get_table_columns(connection: sqlite3.Connection, table: str) -> List[str]:
+    cursor = connection.execute(f"PRAGMA table_info({table})")
+    return [row[1] for row in cursor.fetchall()]
+
+
+def migrate_legacy_db(canonical_path: str, legacy_path: str) -> str:
     canonical = Path(canonical_path)
-    legacy = REPO_ROOT / "mindtriage" / "backend" / "mindtriage.db"
-    if canonical.exists() and legacy.exists():
-        print(f"Using canonical DB at {canonical}. Legacy DB still at {legacy}.")
-        return
-    if not canonical.exists() and legacy.exists():
+    legacy = Path(legacy_path)
+    if not legacy.exists():
+        return "no_legacy"
+
+    if not canonical.exists():
         canonical.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(legacy, canonical)
         print(f"Copied legacy DB from {legacy} to {canonical}.")
+        return "copied_legacy"
+
+    try:
+        canonical_conn = sqlite3.connect(canonical)
+        legacy_conn = sqlite3.connect(legacy)
+        canonical_tables = set(get_sqlite_tables(canonical_conn))
+        legacy_tables = set(get_sqlite_tables(legacy_conn))
+        if "users" not in canonical_tables or "users" not in legacy_tables:
+            return "skipped"
+
+        canonical_users = canonical_conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        legacy_users = legacy_conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        if canonical_users > 0 or legacy_users == 0:
+            return "skipped"
+
+        common_tables = canonical_tables & legacy_tables
+        migrated_tables = 0
+        for table in sorted(common_tables):
+            canonical_cols = set(get_table_columns(canonical_conn, table))
+            legacy_cols = set(get_table_columns(legacy_conn, table))
+            columns = sorted(canonical_cols & legacy_cols)
+            if not columns:
+                continue
+            column_list = ", ".join(columns)
+            placeholders = ", ".join(["?"] * len(columns))
+            rows = legacy_conn.execute(
+                f"SELECT {column_list} FROM {table}"
+            ).fetchall()
+            if not rows:
+                continue
+            canonical_conn.executemany(
+                f"INSERT OR IGNORE INTO {table} ({column_list}) VALUES ({placeholders})",
+                rows,
+            )
+            migrated_tables += 1
+        canonical_conn.commit()
+        print(f"Migrated legacy DB rows from {legacy} into {canonical} ({migrated_tables} tables).")
+        return "migrated"
+    except Exception as exc:
+        print(f"Legacy migration skipped due to error: {exc}")
+        return "skipped"
+    finally:
+        try:
+            canonical_conn.close()
+        except Exception:
+            pass
+        try:
+            legacy_conn.close()
+        except Exception:
+            pass
+
+
+def ensure_canonical_db() -> str:
+    legacy = REPO_ROOT / "mindtriage" / "backend" / "mindtriage.db"
+    status = migrate_legacy_db(DB_PATH, str(legacy))
+    if status == "skipped":
+        canonical = Path(DB_PATH)
+        if canonical.exists() and legacy.exists():
+            print(f"Using canonical DB at {canonical}. Legacy DB still at {legacy}.")
+    return status
 
 
 DB_PATH = resolve_db_path()
-maybe_copy_legacy_db(DB_PATH)
+MIGRATION_STATUS = ensure_canonical_db()
 DATABASE_URL = f"sqlite:///{DB_PATH}"
 SECRET_KEY = "CHANGE_ME"
 EXPORT_SALT = "LOCAL_EXPORT_SALT_CHANGE_ME"
@@ -1007,7 +1078,12 @@ def health() -> dict:
 
 @app.get("/meta")
 def meta() -> dict:
-    return {"version": APP_VERSION, "dev_mode": is_dev_mode(), "db_path": DB_PATH}
+    return {
+        "version": APP_VERSION,
+        "dev_mode": is_dev_mode(),
+        "db_path": DB_PATH,
+        "migration_status": MIGRATION_STATUS,
+    }
 
 
 @app.get("/safety/resources")
