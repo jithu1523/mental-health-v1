@@ -28,6 +28,8 @@ if "rapid_session_date" not in st.session_state:
     st.session_state.rapid_session_date = None
 if "export_bytes" not in st.session_state:
     st.session_state.export_bytes = None
+if "clinician_summary" not in st.session_state:
+    st.session_state.clinician_summary = None
 if "action_plan_rapid" not in st.session_state:
     st.session_state.action_plan_rapid = None
 if "action_plan_regular" not in st.session_state:
@@ -1122,6 +1124,62 @@ with export_tab:
                 )
             elif resp is not None:
                 show_response_error(resp, "/import/anonymized", "Import failed.")
+
+        st.subheader("Clinician Summary")
+        st.caption(
+            "Pattern signals for clinical context — not a diagnosis. "
+            "Share only with people you trust, like your doctor."
+        )
+        summary_days = st.selectbox("Summary range", [7, 30, 90], index=1, key="clinician_summary_days")
+        if st.button("Generate clinician summary"):
+            try:
+                summary_resp = requests.get(
+                    api_url("/export/clinician_summary"),
+                    headers=api_headers(),
+                    params={"days": summary_days, "format": "json"},
+                    timeout=30,
+                )
+            except requests.RequestException as exc:
+                st.error(f"Request failed: {exc}")
+                summary_resp = None
+            if summary_resp is not None and summary_resp.ok:
+                st.session_state.clinician_summary = safe_json(summary_resp)
+            elif summary_resp is not None:
+                show_response_error(summary_resp, "/export/clinician_summary", "Could not generate summary.")
+
+        clinician_summary = st.session_state.get("clinician_summary")
+        if clinician_summary:
+            completeness = clinician_summary.get("data_completeness", {})
+            st.write(
+                f"Range: {completeness.get('start_date')} to {completeness.get('end_date')} | "
+                f"Check-in days logged: {completeness.get('daily_checkin_days_logged')}/"
+                f"{completeness.get('window_days')}"
+            )
+            for cluster in clinician_summary.get("clusters", []):
+                st.write(f"**{cluster['label']}** — {cluster['status'].replace('_', ' ').title()}")
+                st.caption(cluster["description"])
+            safety_summary = clinician_summary.get("safety_summary", {})
+            st.write(f"Crisis events in range: {safety_summary.get('crisis_event_count', 0)}")
+
+            try:
+                html_resp = requests.get(
+                    api_url("/export/clinician_summary"),
+                    headers=api_headers(),
+                    params={"days": summary_days, "format": "html"},
+                    timeout=30,
+                )
+            except requests.RequestException as exc:
+                st.error(f"Request failed: {exc}")
+                html_resp = None
+            if html_resp is not None and html_resp.ok:
+                st.download_button(
+                    "Download summary (HTML)",
+                    data=html_resp.content,
+                    file_name="clinician_summary.html",
+                    mime="text/html",
+                )
+            elif html_resp is not None:
+                show_response_error(html_resp, "/export/clinician_summary", "Could not download summary.")
 
 with safety_tab:
     st.subheader("Safety")

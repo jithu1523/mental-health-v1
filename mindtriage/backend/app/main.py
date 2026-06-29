@@ -35,6 +35,7 @@ from .baseline_engine import (
     compute_drift,
     collect_signals_for_window,
 )
+from .clinician_report import build_clinician_summary, render_clinician_summary_html
 
 APP_VERSION = "1.4.0"
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -2812,6 +2813,29 @@ def export_anonymized(
         content=export_bytes,
         media_type="application/zip",
         headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
+@app.get("/export/clinician_summary")
+def export_clinician_summary(
+    days: int = Query(30, ge=1, le=365),
+    format: str = Query("json", pattern="^(json|html)$"),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Response:
+    summary = build_clinician_summary(user.id, db, days)
+    if format == "html":
+        html_content = render_clinician_summary_html(summary)
+        filename = f"clinician_summary_{date.today().isoformat()}.html"
+        return Response(
+            content=html_content,
+            media_type="text/html",
+            headers={"Content-Disposition": f"attachment; filename={filename}"},
+        )
+    return Response(
+        content=json.dumps(summary, indent=2),
+        media_type="application/json",
+        headers={"Content-Disposition": "attachment; filename=clinician_summary.json"},
     )
 
 

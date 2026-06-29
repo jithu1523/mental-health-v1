@@ -9,3 +9,5 @@ The product emphasizes:
 - Minimal friction for daily use with a calm, non-clinical UI.
 
 MindTriage is not a diagnosis tool. It is designed to support self-awareness and routing to help when needed.
+
+A patient can also generate a clinician summary from the Export tab: a pattern-signal report (mood, anxiety, sleep, energy, social withdrawal, and a crisis/safety log) that they share with their own doctor to help fast-track an evaluation. It surfaces frequency and trend signals only — never a diagnosis label, and never raw journal text.
